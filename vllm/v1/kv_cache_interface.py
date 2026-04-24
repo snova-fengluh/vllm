@@ -481,6 +481,73 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         return merged_spec
 
 
+@dataclass(frozen=True, kw_only=True)
+class SageAttentionSpec(FullAttentionSpec):
+    """
+    KV cache spec for SAGE (Self-Attention Guided Eviction) attention.
+
+    SAGE maintains a bounded KV cache through attention-guided token selection:
+    - Sink tokens: First N tokens always preserved
+    - Top-K tokens: Historically important tokens selected via attention scores
+    - Recent tokens: Sliding window of recent context
+
+    Total cache size = num_sink_tokens + top_k + recent_window_size = window_length
+    """
+
+    window_length: int = 8192  # Total cache window size
+    num_sink_tokens: int = 4   # Always-kept initial tokens
+    top_k: int = 512           # Top-k important tokens
+    num_full_kv_layer: int = 0 # Layers using full cache (no SAGE)
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        """
+        For SAGE, max memory is bounded by window_length, not max_model_len.
+
+        The memory includes:
+        - Main KV cache: window_length tokens
+        - Top-K cache: top_k tokens (stored separately for efficient access)
+        """
+        # Main cache bounded by window length
+        main_cache_tokens = self.window_length
+        # Top-K cache is separate
+        topk_cache_tokens = self.top_k
+
+        total_tokens = main_cache_tokens + topk_cache_tokens
+        return cdiv(total_tokens, self.block_size) * self.page_size_bytes
+
+    @property
+    def recent_window_size(self) -> int:
+        """Size of the recent token window."""
+        return self.window_length - self.num_sink_tokens - self.top_k
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        """Merge a list of SageAttentionSpec objects."""
+        assert all(isinstance(spec, SageAttentionSpec) for spec in specs), (
+            "All attention layers must be SageAttentionSpec."
+        )
+
+        # All SAGE specs should have the same configuration
+        for spec in specs[1:]:
+            assert spec.window_length == specs[0].window_length
+            assert spec.num_sink_tokens == specs[0].num_sink_tokens
+            assert spec.top_k == specs[0].top_k
+
+        return cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            head_size_v=specs[0].head_size_v,
+            dtype=specs[0].dtype,
+            kv_quant_mode=specs[0].kv_quant_mode,
+            page_size_padded=specs[0].page_size_padded,
+            window_length=specs[0].window_length,
+            num_sink_tokens=specs[0].num_sink_tokens,
+            top_k=specs[0].top_k,
+            num_full_kv_layer=specs[0].num_full_kv_layer,
+        )
+
+
 @dataclass(frozen=True)
 class UniformTypeKVCacheSpecs(KVCacheSpec):
     """
@@ -537,6 +604,14 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             return all(
                 isinstance(spec, MambaSpec)
                 and spec.num_speculative_blocks == one_spec.num_speculative_blocks
+                for spec in kv_cache_specs.values()
+            )
+        elif isinstance(one_spec, SageAttentionSpec):
+            return all(
+                isinstance(spec, SageAttentionSpec)
+                and spec.window_length == one_spec.window_length
+                and spec.num_sink_tokens == one_spec.num_sink_tokens
+                and spec.top_k == one_spec.top_k
                 for spec in kv_cache_specs.values()
             )
         else:

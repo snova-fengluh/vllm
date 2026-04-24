@@ -41,7 +41,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config import CacheConfig, ModelConfig, SageConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -92,8 +92,13 @@ SAGE_DEFAULT_TOP_K = 512
 
 
 @dataclass
-class SageConfig:
-    """Configuration for SAGE attention."""
+class SageModelConfig:
+    """Local configuration for SAGE attention in the model.
+
+    This class is used internally by the model. It can be created from:
+    1. CLI arguments via vllm.config.SageConfig (preferred)
+    2. HuggingFace config JSON (fallback for backward compatibility)
+    """
 
     enabled: bool = True
     window_length: int = SAGE_DEFAULT_WINDOW_LENGTH
@@ -102,7 +107,18 @@ class SageConfig:
     num_full_kv_layer: int = 0  # Layers that use full KV cache (no SAGE)
 
     @classmethod
-    def from_hf_config(cls, config: PretrainedConfig) -> "SageConfig":
+    def from_cli_config(cls, sage_config: SageConfig) -> "SageModelConfig":
+        """Create from CLI config (vllm.config.SageConfig)."""
+        return cls(
+            enabled=sage_config.enabled,
+            window_length=sage_config.window_length,
+            num_sink_tokens=sage_config.num_sink_tokens,
+            top_k=sage_config.top_k,
+            num_full_kv_layer=sage_config.num_full_kv_layer,
+        )
+
+    @classmethod
+    def from_hf_config(cls, config: PretrainedConfig) -> "SageModelConfig":
         """Extract SAGE config from HuggingFace config."""
         window_len = getattr(config, "sage_window_length", SAGE_DEFAULT_WINDOW_LENGTH)
         sink_tokens = getattr(
@@ -134,7 +150,7 @@ class SageKVCache:
 
     def __init__(
         self,
-        sage_config: SageConfig,
+        sage_config: SageModelConfig,
         num_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -360,7 +376,7 @@ class MiniMaxM2SageAttention(nn.Module):
         qkv_bias: bool = False,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
-        sage_config: SageConfig | None = None,
+        sage_config: SageModelConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -383,7 +399,7 @@ class MiniMaxM2SageAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
 
         # SAGE configuration
-        self.sage_config = sage_config or SageConfig()
+        self.sage_config = sage_config or SageModelConfig()
         self.use_sage = (
             self.sage_config.enabled and layer_idx >= self.sage_config.num_full_kv_layer
         )
@@ -466,7 +482,7 @@ class MiniMaxM2SageDecoderLayer(nn.Module):
         model_config: ModelConfig,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
-        sage_config: SageConfig | None = None,
+        sage_config: SageModelConfig | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -544,7 +560,13 @@ class MiniMaxM2SageModel(nn.Module):
         self.config = config
 
         # Initialize SAGE configuration
-        self.sage_config = SageConfig.from_hf_config(config)
+        # Prefer CLI config (vllm_config.sage_config) over HF config
+        if vllm_config.sage_config is not None:
+            self.sage_config = SageModelConfig.from_cli_config(vllm_config.sage_config)
+            logger.info("Using SAGE config from CLI arguments")
+        else:
+            self.sage_config = SageModelConfig.from_hf_config(config)
+            logger.info("Using SAGE config from model config.json")
         logger.info(
             "MiniMax M2 SAGE Model: window=%d, sink=%d, top_k=%d",
             self.sage_config.window_length,

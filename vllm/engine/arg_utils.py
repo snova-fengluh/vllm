@@ -55,6 +55,7 @@ from vllm.config import (
     PrefetchOffloadConfig,
     ProfilerConfig,
     ReasoningConfig,
+    SageConfig,
     SchedulerConfig,
     SpeculativeConfig,
     StructuredOutputsConfig,
@@ -558,6 +559,13 @@ class EngineArgs:
     lora_target_modules: list[str] | None = LoRAConfig.target_modules
     enable_tower_connector_lora: bool = LoRAConfig.enable_tower_connector_lora
     specialize_active_lora: bool = LoRAConfig.specialize_active_lora
+
+    # SAGE attention fields
+    sage_enabled: bool = SageConfig.enabled
+    sage_window_length: int = SageConfig.window_length
+    sage_num_sink_tokens: int = SageConfig.num_sink_tokens
+    sage_top_k: int = SageConfig.top_k
+    sage_num_full_kv_layer: int = SageConfig.num_full_kv_layer
 
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
@@ -1224,6 +1232,24 @@ class EngineArgs:
         lora_group.add_argument("--default-mm-loras", **lora_kwargs["default_mm_loras"])
         lora_group.add_argument(
             "--specialize-active-lora", **lora_kwargs["specialize_active_lora"]
+        )
+
+        # SAGE attention arguments
+        sage_kwargs = get_kwargs(SageConfig)
+        sage_group = parser.add_argument_group(
+            title="SageConfig",
+            description=SageConfig.__doc__,
+        )
+        sage_group.add_argument("--sage-enabled", **sage_kwargs["enabled"])
+        sage_group.add_argument(
+            "--sage-window-length", **sage_kwargs["window_length"]
+        )
+        sage_group.add_argument(
+            "--sage-num-sink-tokens", **sage_kwargs["num_sink_tokens"]
+        )
+        sage_group.add_argument("--sage-top-k", **sage_kwargs["top_k"])
+        sage_group.add_argument(
+            "--sage-num-full-kv-layer", **sage_kwargs["num_full_kv_layer"]
         )
 
         # Observability arguments
@@ -1969,6 +1995,19 @@ class EngineArgs:
             else None
         )
 
+        # Create SAGE config if enabled
+        sage_config = (
+            SageConfig(
+                enabled=True,
+                window_length=self.sage_window_length,
+                num_sink_tokens=self.sage_num_sink_tokens,
+                top_k=self.sage_top_k,
+                num_full_kv_layer=self.sage_num_full_kv_layer,
+            )
+            if self.sage_enabled
+            else None
+        )
+
         if (
             lora_config is not None
             and speculative_config is not None
@@ -2130,6 +2169,7 @@ class EngineArgs:
             mamba_config=mamba_config,
             kernel_config=kernel_config,
             lora_config=lora_config,
+            sage_config=sage_config,
             speculative_config=speculative_config,
             structured_outputs_config=self.structured_outputs_config,
             observability_config=observability_config,

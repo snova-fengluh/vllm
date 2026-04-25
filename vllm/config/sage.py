@@ -58,3 +58,14 @@ class SageConfig:
                 raise ValueError(
                     f"num_full_kv_layer must be >= 0, got {self.num_full_kv_layer}"
                 )
+
+    def compute_hash(self) -> str:
+        """
+        Provide a hash that uniquely identifies all the SAGE configs
+        that affect the structure of the computation graph.
+        """
+        from vllm.config.utils import get_hash_factors, hash_factors
+
+        ignored_factors: set[str] = set()
+        factors = get_hash_factors(self, ignored_factors)
+        return hash_factors(factors)

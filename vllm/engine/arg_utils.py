@@ -1511,34 +1511,43 @@ class EngineArgs:
             print(f"  Architecture Override: MiniMaxM2SageForCausalLM")
             print("=" * 60)
 
-            # Merge architecture override into hf_overrides
-            if callable(hf_overrides):
-                # If hf_overrides is a callable, wrap it to also set architectures
-                original_fn = hf_overrides
+            # Always use a callable to override architecture for SAGE
+            # This is more reliable than dict-based overrides
+            original_overrides = hf_overrides
 
-                def sage_hf_overrides(hf_config):
-                    original_fn(hf_config)
-                    # Override architecture to use SAGE variant
-                    if hasattr(hf_config, "architectures"):
-                        archs = hf_config.architectures
-                        if archs and "MiniMaxM2ForCausalLM" in archs:
-                            hf_config.architectures = ["MiniMaxM2SageForCausalLM"]
-                            logger.info(
-                                "SAGE enabled: switching architecture from "
-                                "MiniMaxM2ForCausalLM to MiniMaxM2SageForCausalLM"
-                            )
+            def sage_hf_overrides(hf_config):
+                # Apply original overrides first
+                if callable(original_overrides):
+                    original_overrides(hf_config)
+                elif original_overrides and isinstance(original_overrides, dict):
+                    # Apply dict overrides
+                    for key, value in original_overrides.items():
+                        setattr(hf_config, key, value)
 
-                hf_overrides = sage_hf_overrides
-            else:
-                # hf_overrides is a dict, merge architecture override
-                hf_overrides = dict(hf_overrides) if hf_overrides else {}
-                # We'll set this and let ModelConfig handle it
-                # But we need to read the original config first to check the arch
-                # For now, just set the override - ModelConfig will apply it
-                hf_overrides["architectures"] = ["MiniMaxM2SageForCausalLM"]
-                logger.info(
-                    "SAGE enabled: overriding architecture to MiniMaxM2SageForCausalLM"
-                )
+                # Override architecture to use SAGE variant
+                if hasattr(hf_config, "architectures"):
+                    archs = hf_config.architectures
+                    if archs and "MiniMaxM2ForCausalLM" in archs:
+                        hf_config.architectures = ["MiniMaxM2SageForCausalLM"]
+                        print(
+                            "SAGE: Switched architecture from "
+                            "MiniMaxM2ForCausalLM to MiniMaxM2SageForCausalLM"
+                        )
+                    elif archs:
+                        # For other architectures, still use SAGE
+                        print(f"SAGE: Original architecture: {archs}")
+                        hf_config.architectures = ["MiniMaxM2SageForCausalLM"]
+                        print(
+                            "SAGE: Set architecture to MiniMaxM2SageForCausalLM"
+                        )
+                else:
+                    # No architectures field, set it
+                    hf_config.architectures = ["MiniMaxM2SageForCausalLM"]
+                    print("SAGE: Set architecture to MiniMaxM2SageForCausalLM")
+
+                return hf_config
+
+            hf_overrides = sage_hf_overrides
 
         return ModelConfig(
             model=self.model,

@@ -567,6 +567,19 @@ class MiniMaxM2SageModel(nn.Module):
         else:
             self.sage_config = SageModelConfig.from_hf_config(config)
             logger.info("Using SAGE config from model config.json")
+
+        # Print prominent SAGE initialization message
+        print("=" * 60)
+        print("SAGE MODEL INITIALIZED: MiniMaxM2SageForCausalLM")
+        print("=" * 60)
+        print(f"  SAGE Enabled: {self.sage_config.enabled}")
+        print(f"  Window Length: {self.sage_config.window_length}")
+        print(f"  Sink Tokens: {self.sage_config.num_sink_tokens}")
+        print(f"  Top-K: {self.sage_config.top_k}")
+        print(f"  Full KV Layers: {self.sage_config.num_full_kv_layer}")
+        print(f"  Recent Window: {self.sage_config.recent_window_size}")
+        print("=" * 60)
+
         logger.info(
             "MiniMax M2 SAGE Model: window=%d, sink=%d, top_k=%d",
             self.sage_config.window_length,

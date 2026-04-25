@@ -52,7 +52,7 @@ export NCCL_P2P_DISABLE=0
 export NCCL_IB_DISABLE=0
 
 # ============================================================================
-# Update model config with SAGE parameters
+# Launch vLLM server with SAGE
 # ============================================================================
 
 echo "=============================================="
@@ -70,59 +70,12 @@ echo "  Sink tokens: $SAGE_NUM_SINK_TOKENS"
 echo "  Top-K: $SAGE_TOP_K"
 echo "  Recent window: $((SAGE_WINDOW_LENGTH - SAGE_NUM_SINK_TOKENS - SAGE_TOP_K))"
 echo "=============================================="
-
-# Create a temporary config file with SAGE parameters
-CONFIG_FILE=$(mktemp /tmp/minimax_sage_config.XXXXXX.json)
-trap "rm -f $CONFIG_FILE" EXIT
-
-# Read the original config and add SAGE parameters
-python3 << EOF
-import json
-import sys
-
-model_path = "$MODEL_PATH"
-config_path = f"{model_path}/config.json"
-
-try:
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-except FileNotFoundError:
-    print(f"Error: Config file not found at {config_path}")
-    sys.exit(1)
-
-# Add SAGE configuration
-config['sage_enabled'] = True
-config['sage_window_length'] = $SAGE_WINDOW_LENGTH
-config['sage_num_sink_tokens'] = $SAGE_NUM_SINK_TOKENS
-config['sage_top_k'] = $SAGE_TOP_K
-config['sage_num_full_kv_layer'] = 0
-
-# Update architecture to use SAGE model
-if 'architectures' in config:
-    original_arch = config['architectures']
-    # Map to SAGE architecture
-    config['architectures'] = ['MiniMaxM2SageForCausalLM']
-    print(f"Updated architecture: {original_arch} -> {config['architectures']}")
-
-# Write updated config
-with open("$CONFIG_FILE", 'w') as f:
-    json.dump(config, f, indent=2)
-
-print(f"SAGE config written to: $CONFIG_FILE")
-EOF
-
-# Copy the updated config to the model directory (optional - for persistent changes)
-# cp "$CONFIG_FILE" "$MODEL_PATH/config.json"
-
-# ============================================================================
-# Launch vLLM server
-# ============================================================================
-
 echo ""
-echo "Starting vLLM server..."
+echo "Starting vLLM server with --sage-enabled..."
 echo ""
 
-# Use the SAGE model by overriding the config
+# Launch vLLM with SAGE CLI arguments
+# The --sage-enabled flag automatically switches to MiniMaxM2SageForCausalLM
 python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_PATH" \
     --served-model-name "minimax-m2.5-sage" \
@@ -136,4 +89,8 @@ python3 -m vllm.entrypoints.openai.api_server \
     --trust-remote-code \
     --disable-log-requests \
     --enable-chunked-prefill \
+    --sage-enabled \
+    --sage-window-length "$SAGE_WINDOW_LENGTH" \
+    --sage-num-sink-tokens "$SAGE_NUM_SINK_TOKENS" \
+    --sage-top-k "$SAGE_TOP_K" \
     "$@"

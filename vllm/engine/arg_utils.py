@@ -1498,6 +1498,48 @@ class EngineArgs:
                 self.seed,
             )
 
+        # When SAGE is enabled, automatically switch to the SAGE model variant
+        hf_overrides = self.hf_overrides
+        if self.sage_enabled:
+            print("=" * 60)
+            print("SAGE ATTENTION ENABLED")
+            print("=" * 60)
+            print(f"  Window Length: {self.sage_window_length}")
+            print(f"  Sink Tokens: {self.sage_num_sink_tokens}")
+            print(f"  Top-K: {self.sage_top_k}")
+            print(f"  Full KV Layers: {self.sage_num_full_kv_layer}")
+            print(f"  Architecture Override: MiniMaxM2SageForCausalLM")
+            print("=" * 60)
+
+            # Merge architecture override into hf_overrides
+            if callable(hf_overrides):
+                # If hf_overrides is a callable, wrap it to also set architectures
+                original_fn = hf_overrides
+
+                def sage_hf_overrides(hf_config):
+                    original_fn(hf_config)
+                    # Override architecture to use SAGE variant
+                    if hasattr(hf_config, "architectures"):
+                        archs = hf_config.architectures
+                        if archs and "MiniMaxM2ForCausalLM" in archs:
+                            hf_config.architectures = ["MiniMaxM2SageForCausalLM"]
+                            logger.info(
+                                "SAGE enabled: switching architecture from "
+                                "MiniMaxM2ForCausalLM to MiniMaxM2SageForCausalLM"
+                            )
+
+                hf_overrides = sage_hf_overrides
+            else:
+                # hf_overrides is a dict, merge architecture override
+                hf_overrides = dict(hf_overrides) if hf_overrides else {}
+                # We'll set this and let ModelConfig handle it
+                # But we need to read the original config first to check the arch
+                # For now, just set the override - ModelConfig will apply it
+                hf_overrides["architectures"] = ["MiniMaxM2SageForCausalLM"]
+                logger.info(
+                    "SAGE enabled: overriding architecture to MiniMaxM2SageForCausalLM"
+                )
+
         return ModelConfig(
             model=self.model,
             model_weights=self.model_weights,
@@ -1514,7 +1556,7 @@ class EngineArgs:
             revision=self.revision,
             code_revision=self.code_revision,
             hf_token=self.hf_token,
-            hf_overrides=self.hf_overrides,
+            hf_overrides=hf_overrides,
             tokenizer_revision=self.tokenizer_revision,
             max_model_len=self.max_model_len,
             quantization=self.quantization,

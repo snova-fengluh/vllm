@@ -1241,9 +1241,7 @@ class EngineArgs:
             description=SageConfig.__doc__,
         )
         sage_group.add_argument("--sage-enabled", **sage_kwargs["enabled"])
-        sage_group.add_argument(
-            "--sage-window-length", **sage_kwargs["window_length"]
-        )
+        sage_group.add_argument("--sage-window-length", **sage_kwargs["window_length"])
         sage_group.add_argument(
             "--sage-num-sink-tokens", **sage_kwargs["num_sink_tokens"]
         )
@@ -1501,15 +1499,15 @@ class EngineArgs:
         # When SAGE is enabled, automatically switch to the SAGE model variant
         hf_overrides = self.hf_overrides
         if self.sage_enabled:
-            print("=" * 60)
-            print("SAGE ATTENTION ENABLED")
-            print("=" * 60)
-            print(f"  Window Length: {self.sage_window_length}")
-            print(f"  Sink Tokens: {self.sage_num_sink_tokens}")
-            print(f"  Top-K: {self.sage_top_k}")
-            print(f"  Full KV Layers: {self.sage_num_full_kv_layer}")
-            print(f"  Architecture Override: MiniMaxM2SageForCausalLM")
-            print("=" * 60)
+            logger.info(
+                "SAGE ATTENTION ENABLED  "
+                "window=%d  sink=%d  top_k=%d  "
+                "full_kv_layers=%d  arch=MiniMaxM2SageForCausalLM",
+                self.sage_window_length,
+                self.sage_num_sink_tokens,
+                self.sage_top_k,
+                self.sage_num_full_kv_layer,
+            )
 
             # Always use a callable to override architecture for SAGE
             # This is more reliable than dict-based overrides
@@ -1529,21 +1527,19 @@ class EngineArgs:
                     archs = hf_config.architectures
                     if archs and "MiniMaxM2ForCausalLM" in archs:
                         hf_config.architectures = ["MiniMaxM2SageForCausalLM"]
-                        print(
+                        logger.info(
                             "SAGE: Switched architecture from "
                             "MiniMaxM2ForCausalLM to MiniMaxM2SageForCausalLM"
                         )
                     elif archs:
-                        # For other architectures, still use SAGE
-                        print(f"SAGE: Original architecture: {archs}")
+                        logger.info("SAGE: Original architecture: %s", archs)
                         hf_config.architectures = ["MiniMaxM2SageForCausalLM"]
-                        print(
+                        logger.info(
                             "SAGE: Set architecture to MiniMaxM2SageForCausalLM"
                         )
                 else:
-                    # No architectures field, set it
                     hf_config.architectures = ["MiniMaxM2SageForCausalLM"]
-                    print("SAGE: Set architecture to MiniMaxM2SageForCausalLM")
+                    logger.info("SAGE: Set architecture to MiniMaxM2SageForCausalLM")
 
                 return hf_config
 
@@ -2089,6 +2085,11 @@ class EngineArgs:
             attention_config.backend = AttentionConfig.validate_backend_before(
                 self.attention_backend
             )
+
+        # When SAGE is enabled, force the SAGE attention backend.
+        if self.sage_enabled and attention_config.backend is None:
+            attention_config.backend = AttentionBackendEnum.SAGE_ATTN
+            logger.info("SAGE: Selected attention backend SAGE_ATTN")
 
         # TurboQuant requires FlashAttention 2 — FA3 boundary layers assert
         # FlashAttentionImpl which fails with TurboQuantAttentionImpl.

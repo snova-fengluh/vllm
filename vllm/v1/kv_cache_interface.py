@@ -495,25 +495,18 @@ class SageAttentionSpec(FullAttentionSpec):
     """
 
     window_length: int = 8192  # Total cache window size
-    num_sink_tokens: int = 4   # Always-kept initial tokens
-    top_k: int = 512           # Top-k important tokens
-    num_full_kv_layer: int = 0 # Layers using full cache (no SAGE)
+    num_sink_tokens: int = 4  # Always-kept initial tokens
+    top_k: int = 512  # Top-k important tokens
+    num_full_kv_layer: int = 0  # Layers using full cache (no SAGE)
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """
         For SAGE, max memory is bounded by window_length, not max_model_len.
 
-        The memory includes:
-        - Main KV cache: window_length tokens
-        - Top-K cache: top_k tokens (stored separately for efficient access)
+        window_length already includes [sink] + [top_k] + [recent], so we
+        do NOT add top_k separately.
         """
-        # Main cache bounded by window length
-        main_cache_tokens = self.window_length
-        # Top-K cache is separate
-        topk_cache_tokens = self.top_k
-
-        total_tokens = main_cache_tokens + topk_cache_tokens
-        return cdiv(total_tokens, self.block_size) * self.page_size_bytes
+        return cdiv(self.window_length, self.block_size) * self.page_size_bytes
 
     @property
     def recent_window_size(self) -> int:

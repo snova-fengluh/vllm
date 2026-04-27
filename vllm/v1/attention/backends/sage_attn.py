@@ -3,28 +3,21 @@
 """
 SAGE (Self-Attention Guided Eviction) Attention Backend for vLLM.
 
-SAGE combines StreamLLM-style windowing with attention-guided top-k selection
-to maintain a bounded KV cache for efficient long-sequence inference.
-
-KV Cache Structure:
-    [sink_tokens] + [top_k_important_tokens] + [recent_tokens]
-         ^                    ^                     ^
-       Always kept      Selected via Q·K       Sliding window
-
-Algorithm Flow:
-1. Prefill Phase: Accumulate all KV pairs normally
-2. Trigger: When kv_length > window_length, activate eviction
-3. Top-K Selection (one-pass, after prefill):
-   - Extract eviction candidates: kv_cache[sink:-recent]
-   - Compute: scores = query @ evict_keys.T
-   - Select top-k indices per query head
-   - Store in separate topk_key_cache, topk_value_cache
-4. StreamLLM Update: Maintain [sink] + [recent] + [new] in main cache
-5. Attention: Concatenate main cache with top-k cache for attention
+Algorithm (per decode row whose seq_len > window_length):
+  1. Gather candidate KV slice [num_sink : seq_len - recent_window] from
+     the paged cache.
+  2. Compute scores = query · keysᵀ · scale, GQA-reduce, topk → indices.
+     Store indices on SageRequestState (done once at prefill→decode edge).
+  3. Build dense KV = concat(paged[0:num_sink],
+                             paged[topk_indices],
+                             paged[seq_len - (recent - 1) : seq_len])
+  4. Run flash_attn_varlen_func against the dense KV (causal=False).
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
@@ -47,10 +40,12 @@ from vllm.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
 )
 from vllm.v1.attention.backends.sage_cache_state import (
-    SageCacheState,
-    create_sage_cache_state,
+    SageRequestState,
+    SageRequestStateRegistry,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+
+if TYPE_CHECKING:
+    from vllm.v1.kv_cache_interface import AttentionSpec
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -60,20 +55,19 @@ if is_flash_attn_varlen_func_available():
 
 logger = init_logger(__name__)
 
-
 # SAGE configuration defaults (can be overridden via model config)
 SAGE_DEFAULT_WINDOW_LENGTH = 8192
 SAGE_DEFAULT_NUM_SINK_TOKENS = 4
 SAGE_DEFAULT_TOP_K = 512
 
 
-class SageAttentionBackend(AttentionBackend):
-    """
-    SAGE attention backend that wraps FlashAttention with SAGE cache management.
+# ---------------------------------------------------------------------------
+# Backend descriptor
+# ---------------------------------------------------------------------------
 
-    This backend implements the SAGE (Self-Attention Guided Eviction) algorithm
-    which maintains a bounded KV cache through attention-guided token selection.
-    """
+
+class SageAttentionBackend(AttentionBackend):
+    """SAGE attention backend wrapping FlashAttention with bounded KV cache."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -98,11 +92,10 @@ class SageAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_non_causal(cls) -> bool:
-        return False  # SAGE is designed for causal/autoregressive models
+        return False
 
     @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
-        """SAGE only supports decoder attention."""
         return attn_type == AttentionType.DECODER
 
     @classmethod
@@ -111,11 +104,11 @@ class SageAttentionBackend(AttentionBackend):
         return fa_version is not None and fa_version >= 3
 
     @staticmethod
-    def get_impl_cls() -> type["SageAttentionImpl"]:
+    def get_impl_cls() -> type[SageAttentionImpl]:
         return SageAttentionImpl
 
     @staticmethod
-    def get_builder_cls() -> type["SageAttentionMetadataBuilder"]:
+    def get_builder_cls() -> type[SageAttentionMetadataBuilder]:
         return SageAttentionMetadataBuilder
 
     @staticmethod
@@ -134,7 +127,6 @@ class SageAttentionBackend(AttentionBackend):
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
-        # Same layout as FlashAttention
         if include_num_layers_dimension:
             return (2, 0, 1, 3, 4, 5)
         return (0, 1, 2, 3, 4)
@@ -157,7 +149,6 @@ class SageAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_sink(cls) -> bool:
-        # SAGE has its own sink token handling
         return True
 
     @classmethod
@@ -165,9 +156,14 @@ class SageAttentionBackend(AttentionBackend):
         return capability >= DeviceCapability(8, 0)
 
 
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class SageAttentionMetadata:
-    """Metadata for SAGE attention."""
+    """Per-batch metadata consumed by SageAttentionImpl.forward()."""
 
     num_actual_tokens: int
     max_query_len: int
@@ -176,12 +172,21 @@ class SageAttentionMetadata:
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
-
-    # SAGE-specific metadata
-    sage_cache_state: SageCacheState | None = None
-    is_first_decode_after_prefill: bool = False
-
     causal: bool = True
+
+    # Per-row lists (length = num_reqs).
+    request_ids: list[str] | None = None
+    request_states: list[SageRequestState | None] | None = None
+    # Bool tensor [num_reqs]: True when seq_len > window_length.
+    is_long_context: torch.Tensor | None = None
+    # Bool tensor [num_reqs]: True on the first decode step after prefill
+    # for that request.
+    is_first_long_decode: torch.Tensor | None = None
+
+
+# ---------------------------------------------------------------------------
+# Metadata builder
+# ---------------------------------------------------------------------------
 
 
 class SageAttentionMetadataBuilder(AttentionMetadataBuilder[SageAttentionMetadata]):
@@ -193,8 +198,8 @@ class SageAttentionMetadataBuilder(AttentionMetadataBuilder[SageAttentionMetadat
     @classmethod
     def get_cudagraph_support(
         cls,
-        vllm_config: "VllmConfig",
-        kv_cache_spec: "AttentionSpec",
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
         return cls._cudagraph_support
 
@@ -218,30 +223,36 @@ class SageAttentionMetadataBuilder(AttentionMetadataBuilder[SageAttentionMetadat
         self.headdim = self.model_config.get_head_size()
         self.block_size = kv_cache_spec.block_size
 
-        # SAGE configuration from model config or defaults
-        hf_config = self.model_config.hf_config
-        self.sage_window_length = getattr(
-            hf_config, "sage_window_length", SAGE_DEFAULT_WINDOW_LENGTH
-        )
-        self.sage_num_sink_tokens = getattr(
-            hf_config, "sage_num_sink_tokens", SAGE_DEFAULT_NUM_SINK_TOKENS
-        )
-        self.sage_top_k = getattr(hf_config, "sage_top_k", SAGE_DEFAULT_TOP_K)
+        # SAGE configuration (prefer sage_config from CLI, fall back to
+        # attributes injected on hf_config).
+        sage_cfg = vllm_config.sage_config
+        if sage_cfg is not None:
+            self.sage_window_length = sage_cfg.window_length
+            self.sage_num_sink_tokens = sage_cfg.num_sink_tokens
+            self.sage_top_k = sage_cfg.top_k
+        else:
+            hf_config = self.model_config.hf_config
+            self.sage_window_length = getattr(
+                hf_config, "sage_window_length", SAGE_DEFAULT_WINDOW_LENGTH
+            )
+            self.sage_num_sink_tokens = getattr(
+                hf_config, "sage_num_sink_tokens", SAGE_DEFAULT_NUM_SINK_TOKENS
+            )
+            self.sage_top_k = getattr(hf_config, "sage_top_k", SAGE_DEFAULT_TOP_K)
 
-        # Create SAGE cache state
-        num_layers = self.model_config.get_num_layers(vllm_config.parallel_config)
-        self.sage_cache_state = create_sage_cache_state(
-            num_layers=num_layers,
-            window_length=self.sage_window_length,
-            num_sink_tokens=self.sage_num_sink_tokens,
-            top_k=self.sage_top_k,
+        self.sage_recent_window = (
+            self.sage_window_length - self.sage_num_sink_tokens - self.sage_top_k
         )
+
+        # Per-request state registry
+        self.state_registry = SageRequestStateRegistry()
 
         logger.info(
-            "SAGE Attention initialized: window=%d, sink=%d, top_k=%d",
+            "SAGE Attention initialized: window=%d, sink=%d, top_k=%d, recent=%d",
             self.sage_window_length,
             self.sage_num_sink_tokens,
             self.sage_top_k,
+            self.sage_recent_window,
         )
 
     def build(
@@ -259,17 +270,50 @@ class SageAttentionMetadataBuilder(AttentionMetadataBuilder[SageAttentionMetadat
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
         causal = common_attn_metadata.causal
+        request_ids = common_attn_metadata.request_ids
+        num_reqs = common_attn_metadata.num_reqs
 
-        # Check if this is the first decode step after prefill
-        # This is when we perform top-k selection
-        is_first_decode = (
-            max_query_len == 1
-            and max_seq_len > self.sage_window_length
-            and not self.sage_cache_state.eviction_triggered
+        # Build per-row state lists.
+        req_states: list[SageRequestState | None] = []
+        is_long_list: list[bool] = []
+        is_first_long_list: list[bool] = []
+
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        active_ids: set[str] = set()
+
+        for i in range(num_reqs):
+            rid = request_ids[i] if request_ids else ""
+            if rid:
+                active_ids.add(rid)
+            seq_len_i = (
+                int(seq_lens[i].item())
+                if seq_lens.is_cpu
+                else int(seq_lens.cpu()[i].item())
+            )
+            q_len_i = int(query_start_loc_cpu[i + 1] - query_start_loc_cpu[i])
+            is_long = seq_len_i > self.sage_window_length
+            state = self.state_registry.get_or_create(rid) if rid else None
+            is_first = (
+                is_long
+                and q_len_i == 1
+                and state is not None
+                and not state.prefill_done
+            )
+            if is_first and state is not None:
+                state.prefill_done = True
+            req_states.append(state)
+            is_long_list.append(is_long)
+            is_first_long_list.append(is_first)
+
+        # Prune finished requests.
+        if active_ids:
+            self.state_registry.prune(active_ids)
+
+        device = query_start_loc.device
+        is_long_context = torch.tensor(is_long_list, dtype=torch.bool, device=device)
+        is_first_long_decode = torch.tensor(
+            is_first_long_list, dtype=torch.bool, device=device
         )
-
-        if is_first_decode:
-            self.sage_cache_state.eviction_triggered = True
 
         return SageAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -279,23 +323,98 @@ class SageAttentionMetadataBuilder(AttentionMetadataBuilder[SageAttentionMetadat
             seq_lens=seq_lens,
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
-            sage_cache_state=self.sage_cache_state,
-            is_first_decode_after_prefill=is_first_decode,
             causal=causal,
+            request_ids=request_ids,
+            request_states=req_states,
+            is_long_context=is_long_context,
+            is_first_long_decode=is_first_long_decode,
         )
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
-        # SAGE handles its own cache management, no cascade needed
         return False
 
 
-class SageAttentionImpl(AttentionImpl):
-    """
-    SAGE attention implementation.
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    This implementation wraps FlashAttention and adds SAGE cache management
-    for efficient long-sequence inference.
+
+def _gather_paged_kv(
+    kv_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    token_indices: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather KV pairs from the paged cache for a single request.
+
+    Args:
+        kv_cache: [2, num_blocks, block_size, num_kv_heads, head_size]
+        block_table_row: [max_blocks_per_seq] int32 block ids for this req.
+        token_indices: 1-D int64 tensor of token positions to gather.
+        block_size: tokens per block.
+
+    Returns:
+        (keys, values) each [len(token_indices), num_kv_heads, head_size]
     """
+    key_cache = kv_cache[0]  # [num_blocks, block_size, num_kv_heads, head_size]
+    value_cache = kv_cache[1]
+
+    block_ids = block_table_row[token_indices // block_size]  # physical blocks
+    slot_offsets = token_indices % block_size
+
+    # Gather: index [block_ids, slot_offsets] → [N, num_kv_heads, head_size]
+    gathered_keys = key_cache[block_ids, slot_offsets]
+    gathered_values = value_cache[block_ids, slot_offsets]
+    return gathered_keys, gathered_values
+
+
+def _topk_select_for_row(
+    query_row: torch.Tensor,
+    candidate_keys: torch.Tensor,
+    top_k: int,
+    scale: float,
+    num_queries_per_kv: int,
+) -> torch.Tensor:
+    """Compute top-k indices for one decode row.
+
+    Args:
+        query_row: [num_heads, head_dim]  (num_heads = num_q_heads)
+        candidate_keys: [num_candidates, num_kv_heads, head_dim]
+        top_k: number of indices to select per KV head.
+        scale: softmax scale.
+        num_queries_per_kv: GQA ratio (num_heads // num_kv_heads).
+
+    Returns:
+        indices: [num_kv_heads, top_k] int64
+    """
+    num_kv_heads = candidate_keys.shape[1]
+    head_dim = candidate_keys.shape[2]
+
+    # Reshape query to [num_kv_heads, num_q_per_kv, head_dim]
+    q = query_row.view(num_kv_heads, num_queries_per_kv, head_dim)
+
+    # candidate_keys: [N, num_kv_heads, head_dim] → [num_kv_heads, N, head_dim]
+    k = candidate_keys.permute(1, 0, 2)  # [H_kv, N, D]
+
+    # scores: [H_kv, num_q_per_kv, N] = einsum("hqd,hnd->hqn", q, k)
+    scores = torch.einsum("hqd,hnd->hqn", q, k) * scale
+
+    # GQA reduce: sum over query-heads-per-kv-head → [H_kv, N]
+    scores = scores.sum(dim=1)
+
+    actual_k = min(top_k, scores.shape[-1])
+    _, indices = torch.topk(scores, k=actual_k, dim=-1, sorted=False)
+    return indices  # [num_kv_heads, actual_k]
+
+
+# ---------------------------------------------------------------------------
+# Attention implementation
+# ---------------------------------------------------------------------------
+
+
+class SageAttentionImpl(AttentionImpl):
+    """SAGE attention: standard FA for prefill/short-context decode,
+    gather+topk+dense-FA for long-context decode."""
 
     can_return_lse_for_decode: bool = False
 
@@ -322,7 +441,7 @@ class SageAttentionImpl(AttentionImpl):
         if alibi_slopes is not None:
             raise ValueError("SAGE attention does not support ALiBi")
 
-        self.sliding_window = (-1, -1)  # SAGE handles windowing internally
+        self.sliding_window = (-1, -1)
         self.kv_cache_dtype = kv_cache_dtype
 
         if logits_soft_cap is None:
@@ -332,25 +451,57 @@ class SageAttentionImpl(AttentionImpl):
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         self.attn_type = attn_type
 
-        self.vllm_flash_attn_version = get_flash_attn_version(
-            head_size=head_size,
-        )
+        self.vllm_flash_attn_version = get_flash_attn_version(head_size=head_size)
 
         logger.info_once(
             "SAGE attention using FlashAttention version %s",
             self.vllm_flash_attn_version,
         )
 
-        # Get SAGE config from vllm config
+        # SAGE config
         vllm_config = get_current_vllm_config()
-        hf_config = vllm_config.model_config.hf_config
-        self.sage_window_length = getattr(
-            hf_config, "sage_window_length", SAGE_DEFAULT_WINDOW_LENGTH
+        sage_cfg = vllm_config.sage_config
+        if sage_cfg is not None:
+            self.sage_window_length = sage_cfg.window_length
+            self.sage_num_sink_tokens = sage_cfg.num_sink_tokens
+            self.sage_top_k = sage_cfg.top_k
+        else:
+            hf_config = vllm_config.model_config.hf_config
+            self.sage_window_length = getattr(
+                hf_config, "sage_window_length", SAGE_DEFAULT_WINDOW_LENGTH
+            )
+            self.sage_num_sink_tokens = getattr(
+                hf_config, "sage_num_sink_tokens", SAGE_DEFAULT_NUM_SINK_TOKENS
+            )
+            self.sage_top_k = getattr(hf_config, "sage_top_k", SAGE_DEFAULT_TOP_K)
+
+        self.sage_recent_window = (
+            self.sage_window_length - self.sage_num_sink_tokens - self.sage_top_k
         )
-        self.sage_num_sink_tokens = getattr(
-            hf_config, "sage_num_sink_tokens", SAGE_DEFAULT_NUM_SINK_TOKENS
+
+    # ---- KV cache update (called by runner before forward) ----
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        key_cache, value_cache = kv_cache.unbind(0)
+        reshape_and_cache_flash(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            self.kv_cache_dtype,
+            layer._k_scale,
+            layer._v_scale,
         )
-        self.sage_top_k = getattr(hf_config, "sage_top_k", SAGE_DEFAULT_TOP_K)
+
+    # ---- Forward ----
 
     def forward(
         self,
@@ -364,39 +515,44 @@ class SageAttentionImpl(AttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Forward pass with SAGE attention.
-
-        Args:
-            query: shape = [num_tokens, num_heads, head_size]
-            key: shape = [num_tokens, num_kv_heads, head_size]
-            value: shape = [num_tokens, num_kv_heads, head_size]
-            kv_cache: shape = [2, num_blocks, block_size, num_kv_heads, head_size]
-            attn_metadata: SAGE attention metadata
-            output: shape = [num_tokens, num_heads * head_size]
-
-        Returns:
-            Output tensor of shape [num_tokens, num_heads * head_size]
-        """
         if attn_metadata is None:
-            # Profiling run
             return output.fill_(0)
 
         assert self.vllm_flash_attn_version is not None
 
+        # Determine if there are any long-context decode rows.
+        has_long_decode = (
+            attn_metadata.is_long_context is not None
+            and attn_metadata.max_query_len == 1
+            and attn_metadata.is_long_context.any().item()
+        )
+
+        if not has_long_decode:
+            # ---- Standard FlashAttention path (prefill, short decode) ----
+            return self._flash_attn_forward(
+                layer, query, kv_cache, attn_metadata, output
+            )
+
+        # ---- Mixed batch: some rows need SAGE, others are standard ----
+        return self._sage_mixed_forward(layer, query, kv_cache, attn_metadata, output)
+
+    # ---- Standard FA path ----
+
+    def _flash_attn_forward(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: SageAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
         num_actual_tokens = attn_metadata.num_actual_tokens
         key_cache, value_cache = kv_cache.unbind(0)
 
-        # Standard FlashAttention forward for now
-        # The SAGE logic will be integrated in the model's attention layer
-        cu_seqlens_q = attn_metadata.query_start_loc
-        seqused_k = attn_metadata.seq_lens
-        max_seqlen_q = attn_metadata.max_query_len
-        max_seqlen_k = attn_metadata.max_seq_len
-        block_table = attn_metadata.block_table
-
-        descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
-
+        descale_shape = (
+            attn_metadata.query_start_loc.shape[0] - 1,
+            self.num_kv_heads,
+        )
         k_descale = layer._k_scale.expand(descale_shape)
         v_descale = layer._v_scale.expand(descale_shape)
 
@@ -405,10 +561,116 @@ class SageAttentionImpl(AttentionImpl):
             k=key_cache,
             v=value_cache,
             out=output[:num_actual_tokens],
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            max_seqlen_q=attn_metadata.max_query_len,
+            seqused_k=attn_metadata.seq_lens,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            softmax_scale=self.scale,
+            causal=attn_metadata.causal,
+            alibi_slopes=None,
+            window_size=list(self.sliding_window),
+            block_table=attn_metadata.block_table,
+            softcap=self.logits_soft_cap,
+            fa_version=self.vllm_flash_attn_version,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+        return output
+
+    # ---- SAGE mixed path ----
+
+    def _sage_mixed_forward(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: SageAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Handle a batch mixing standard and SAGE rows."""
+        num_reqs = attn_metadata.seq_lens.shape[0]
+        assert attn_metadata.is_long_context is not None
+        assert attn_metadata.request_states is not None
+        query_start_loc = attn_metadata.query_start_loc
+
+        # Detect the layer index from the layer's prefix (set by Attention).
+        layer_idx = getattr(layer, "_layer_index", 0)
+
+        # Process each row.  For a decode-only batch every row has q_len = 1,
+        # so query[i] is the i-th row's single query token.
+        for i in range(num_reqs):
+            q_start = int(query_start_loc[i].item())
+            q_end = int(query_start_loc[i + 1].item())
+            q_len = q_end - q_start
+
+            if q_len != 1 or not attn_metadata.is_long_context[i]:
+                # Prefill or short-context decode → standard FA for this row.
+                self._standard_row(
+                    layer,
+                    query,
+                    kv_cache,
+                    attn_metadata,
+                    output,
+                    row_idx=i,
+                    q_start=q_start,
+                    q_end=q_end,
+                )
+                continue
+
+            # Long-context decode → SAGE path.
+            state = attn_metadata.request_states[i]
+            seq_len = int(attn_metadata.seq_lens[i].item())
+            block_table_row = attn_metadata.block_table[i]
+
+            self._sage_decode_one_row(
+                layer=layer,
+                query_row=query[q_start],  # [num_heads, head_dim]
+                kv_cache=kv_cache,
+                block_table_row=block_table_row,
+                seq_len=seq_len,
+                state=state,
+                layer_idx=layer_idx,
+                is_first_long=(
+                    attn_metadata.is_first_long_decode is not None
+                    and attn_metadata.is_first_long_decode[i].item()
+                ),
+                output_row=output[q_start],  # [num_heads, head_dim]
+            )
+
+        return output
+
+    def _standard_row(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: SageAttentionMetadata,
+        output: torch.Tensor,
+        row_idx: int,
+        q_start: int,
+        q_end: int,
+    ) -> None:
+        """Run standard FlashAttention for a single row (slice of batch)."""
+        key_cache, value_cache = kv_cache.unbind(0)
+        q_len = q_end - q_start
+
+        cu_seqlens_q = torch.tensor([0, q_len], dtype=torch.int32, device=query.device)
+        seq_used_k = attn_metadata.seq_lens[row_idx : row_idx + 1]
+        block_table = attn_metadata.block_table[row_idx : row_idx + 1]
+
+        descale_shape = (1, self.num_kv_heads)
+        k_descale = layer._k_scale.expand(descale_shape)
+        v_descale = layer._v_scale.expand(descale_shape)
+
+        flash_attn_varlen_func(
+            q=query[q_start:q_end],
+            k=key_cache,
+            v=value_cache,
+            out=output[q_start:q_end],
             cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            seqused_k=seqused_k,
-            max_seqlen_k=max_seqlen_k,
+            max_seqlen_q=q_len,
+            seqused_k=seq_used_k,
+            max_seqlen_k=int(seq_used_k.item()),
             softmax_scale=self.scale,
             causal=attn_metadata.causal,
             alibi_slopes=None,
@@ -420,107 +682,106 @@ class SageAttentionImpl(AttentionImpl):
             v_descale=v_descale,
         )
 
-        return output
-
-    def do_kv_cache_update(
+    def _sage_decode_one_row(
         self,
         layer: torch.nn.Module,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        query_row: torch.Tensor,
         kv_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
+        block_table_row: torch.Tensor,
+        seq_len: int,
+        state: SageRequestState | None,
+        layer_idx: int,
+        is_first_long: bool,
+        output_row: torch.Tensor,
     ) -> None:
-        """Update the KV cache with new key-value pairs."""
-        key_cache, value_cache = kv_cache.unbind(0)
+        """Run SAGE decode for a single long-context row."""
+        num_sink = self.sage_num_sink_tokens
+        recent = self.sage_recent_window
+        top_k = self.sage_top_k
+        block_size = kv_cache.shape[2]  # [2, num_blocks, block_size, ...]
+        device = query_row.device
 
-        reshape_and_cache_flash(
-            key,
-            value,
-            key_cache,
-            value_cache,
-            slot_mapping,
-            self.kv_cache_dtype,
-            layer._k_scale,
-            layer._v_scale,
+        # --- Top-k selection (once per request at prefill→decode edge) ---
+        if (
+            is_first_long
+            and state is not None
+            and layer_idx not in state.topk_indices_per_layer
+        ):
+            # Gather candidate KV: tokens [num_sink .. seq_len - recent]
+            cand_start = num_sink
+            cand_end = seq_len - recent
+            if cand_end > cand_start:
+                cand_indices = torch.arange(
+                    cand_start, cand_end, dtype=torch.int64, device=device
+                )
+                cand_keys, _ = _gather_paged_kv(
+                    kv_cache, block_table_row, cand_indices, block_size
+                )
+                # cand_keys: [N_cand, num_kv_heads, head_dim]
+                indices = _topk_select_for_row(
+                    query_row, cand_keys, top_k, self.scale, self.num_queries_per_kv
+                )
+                # indices: [num_kv_heads, actual_k] – these are offsets into
+                # cand_indices, so map back to absolute positions.
+                abs_indices = cand_indices[indices]  # broadcast gather
+                state.topk_indices_per_layer[layer_idx] = abs_indices
+
+        # --- Build dense KV = [sink] + [topk] + [recent] ---
+        sink_indices = torch.arange(0, num_sink, dtype=torch.int64, device=device)
+        # recent window: last (recent - 1) tokens before the current one.
+        recent_start = max(seq_len - recent, num_sink)
+        recent_indices = torch.arange(
+            recent_start, seq_len, dtype=torch.int64, device=device
         )
 
-    def _topk_select(
-        self,
-        query: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        sage_cache_state: SageCacheState,
-        layer_idx: int,
-        seq_len: int,
-    ) -> None:
-        """
-        Perform one-pass top-k selection after prefill.
+        # Collect topk indices (per KV head).  For the dense tensor we need
+        # a single flat set of token positions.  Merge all KV-head indices.
+        if state is not None and layer_idx in state.topk_indices_per_layer:
+            topk_idx = state.topk_indices_per_layer[layer_idx]
+            # topk_idx: [num_kv_heads, actual_k] – flatten and unique
+            topk_flat = topk_idx.reshape(-1).unique()
+        else:
+            topk_flat = torch.empty(0, dtype=torch.int64, device=device)
 
-        This method:
-        1. Extracts eviction candidates from the cache
-        2. Computes Q·K dot products
-        3. Selects top-k indices per query head
-        4. Stores top-k KV pairs in the SAGE cache state
+        # Merge all indices and de-duplicate while preserving order.
+        all_indices = torch.cat([sink_indices, topk_flat, recent_indices])
+        all_indices = all_indices.unique(sorted=True)
 
-        Args:
-            query: Current query tensor [batch, num_heads, 1, head_dim]
-            key_cache: Key cache tensor
-            value_cache: Value cache tensor
-            sage_cache_state: SAGE cache state manager
-            layer_idx: Current layer index
-            seq_len: Current sequence length
-        """
-        if sage_cache_state.is_topk_selected(layer_idx):
-            return
+        dense_keys, dense_values = _gather_paged_kv(
+            kv_cache, block_table_row, all_indices, block_size
+        )
+        # dense_keys: [window_len, num_kv_heads, head_dim]
 
-        num_sink = sage_cache_state.num_sink_tokens
-        top_k = sage_cache_state.top_k
-        recent_window = sage_cache_state.get_recent_window_size()
+        window_len = dense_keys.shape[0]
 
-        # Calculate eviction region boundaries
-        # Eviction candidates are tokens between sink and recent window
-        evict_start = num_sink
-        evict_end = seq_len - recent_window
+        # Run FlashAttention on the dense KV (single-sequence).
+        cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
 
-        if evict_end <= evict_start:
-            # Not enough tokens to evict, skip top-k selection
-            return
+        # We need to expand dense KV from [window_len, num_kv_heads, head_dim]
+        # to block-table format or use the non-paged varlen interface.
+        # The simplest path: pass dense K/V directly (no block_table).
 
-        evict_len = evict_end - evict_start
+        # query_row: [num_heads, head_dim] → [1, num_heads, head_dim]
+        q = query_row.unsqueeze(0)
 
-        # Select all candidates if not enough, otherwise use top_k
-        actual_top_k = evict_len if evict_len < top_k else top_k
+        # FlashAttention expects k, v as contiguous [num_tokens, num_kv_heads, head_dim]
+        # when block_table is not provided.
+        out_buf = output_row.unsqueeze(0)  # [1, num_heads, head_dim]
 
-        # Extract eviction candidates from cache
-        # This requires gathering from paged cache, which we'll implement
-        # For now, we assume contiguous access to the eviction region
-        # In production, this would use block table to gather
-
-        # Compute attention scores
-        # query: [batch, num_heads, 1, head_dim]
-        # evict_keys: [batch, num_kv_heads, evict_len, head_dim]
-
-        # For GQA, expand KV heads to match query heads
-        if self.num_queries_per_kv > 1:
-            # This would need actual key cache access
-            pass
-
-        # Select top-k indices and gather KV pairs
-        # topk_indices, _ = sage_topk_selection(
-        #     query, evict_keys, actual_top_k, self.scale
-        # )
-        # topk_keys, topk_values = gather_topk_kv(
-        #     evict_keys, evict_values, topk_indices
-        # )
-
-        # Store in SAGE cache state
-        # sage_cache_state.set_topk_cache(
-        #     layer_idx, topk_keys, topk_values, topk_indices
-        # )
-
-        logger.debug(
-            "Layer %d: Selected top-%d from %d eviction candidates",
-            layer_idx,
-            actual_top_k,
-            evict_len,
+        flash_attn_varlen_func(
+            q=q,
+            k=dense_keys,
+            v=dense_values,
+            out=out_buf,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=1,
+            seqused_k=torch.tensor([window_len], dtype=torch.int32, device=device),
+            max_seqlen_k=window_len,
+            softmax_scale=self.scale,
+            causal=False,  # not causal – positions are non-contiguous
+            alibi_slopes=None,
+            window_size=[-1, -1],
+            block_table=None,
+            softcap=self.logits_soft_cap,
+            fa_version=self.vllm_flash_attn_version,
         )

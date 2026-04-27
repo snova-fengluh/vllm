@@ -2166,6 +2166,12 @@ class GPUModelRunner(
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
+        # Expose request_ids for backends that need per-request state
+        # (e.g. SAGE).  Pad with empty strings for CUDAGraph padding slots.
+        _request_ids = list(self.input_batch.req_ids[:num_reqs])
+        if num_reqs_padded > num_reqs:
+            _request_ids.extend([""] * (num_reqs_padded - num_reqs))
+
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -2180,6 +2186,7 @@ class GPUModelRunner(
             slot_mapping=slot_mapping_gid_0,
             causal=True,
             is_prefilling=is_prefilling,
+            request_ids=_request_ids,
         )
 
         if self.dcp_world_size > 1:

@@ -67,6 +67,11 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+    SageAttentionSpec,
+    get_kv_quant_mode,
+)
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .minimax_m2 import (
@@ -138,224 +143,45 @@ class SageModelConfig:
         return self.window_length - self.num_sink_tokens - self.top_k
 
 
-class SageKVCache:
-    """
-    SAGE KV cache manager for a single layer.
+class SageAttention(Attention):
+    """Attention subclass that returns SageAttentionSpec for SAGE layers.
 
-    This class manages the KV cache with SAGE eviction logic:
-    - Maintains sink tokens (always preserved)
-    - Selects top-k important tokens via attention scores
-    - Keeps a sliding window of recent tokens
+    For layers whose ``layer_idx < sage_config.num_full_kv_layer``, the
+    standard ``FullAttentionSpec`` is returned (full KV cache, no SAGE).
+    Otherwise a ``SageAttentionSpec`` is returned so that the KV cache
+    budget is bounded by ``window_length``.
     """
 
     def __init__(
         self,
+        *args: Any,
         sage_config: SageModelConfig,
-        num_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ):
-        self.config = sage_config
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim
-        self.dtype = dtype
-        self.device = device
-
-        # Top-k cache (separate from main paged cache)
-        # Shape: [batch, num_heads, top_k, head_dim]
-        self.topk_key_cache: torch.Tensor | None = None
-        self.topk_value_cache: torch.Tensor | None = None
-
-        # Tracking state
-        self.seen_tokens: int = 0
-        self.topk_selected: bool = False
-        self.topk_indices: torch.Tensor | None = None
-
-    def should_trigger_eviction(self, seq_len: int) -> bool:
-        """Check if we should trigger SAGE eviction."""
-        return seq_len > self.config.window_length and not self.topk_selected
-
-    def perform_topk_selection(
-        self,
-        query: torch.Tensor,
-        keys: torch.Tensor,
-        values: torch.Tensor,
-        scale: float,
+        layer_idx: int,
+        **kwargs: Any,
     ) -> None:
-        """
-        Perform one-pass top-k selection.
+        super().__init__(*args, **kwargs)
+        self.sage_config = sage_config
+        self.layer_idx = layer_idx
 
-        This is called once after prefill when sequence length exceeds window.
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        # Layers below the full-KV threshold use the standard spec.
+        if self.layer_idx < self.sage_config.num_full_kv_layer:
+            return super().get_kv_cache_spec(vllm_config)
 
-        Args:
-            query: Query tensor [batch, num_heads, 1, head_dim]
-            keys: Key cache [batch, num_kv_heads, seq_len, head_dim]
-            values: Value cache [batch, num_kv_heads, seq_len, head_dim]
-            scale: Attention scaling factor
-        """
-        if self.topk_selected:
-            return
-
-        batch_size = query.shape[0]
-        seq_len = keys.shape[2]
-
-        # Calculate eviction region
-        num_sink = self.config.num_sink_tokens
-        recent_size = self.config.recent_window_size
-        top_k = self.config.top_k
-
-        evict_start = num_sink
-        evict_end = seq_len - recent_size
-
-        if evict_end <= evict_start:
-            # Not enough tokens for eviction
-            return
-
-        # Extract eviction candidates
-        evict_keys = keys[:, :, evict_start:evict_end, :]
-        evict_values = values[:, :, evict_start:evict_end, :]
-        evict_len = evict_keys.shape[2]
-
-        actual_top_k = min(top_k, evict_len)
-
-        # Handle GQA: expand KV heads for attention score computation
-        n_rep = self.num_heads // self.num_kv_heads
-        if n_rep > 1:
-            # Expand keys for score computation
-            evict_keys_expanded = (
-                evict_keys[:, :, None, :, :]
-                .expand(batch_size, self.num_kv_heads, n_rep, evict_len, self.head_dim)
-                .reshape(batch_size, self.num_heads, evict_len, self.head_dim)
-            )
-
-            evict_values_expanded = (
-                evict_values[:, :, None, :, :]
-                .expand(batch_size, self.num_kv_heads, n_rep, evict_len, self.head_dim)
-                .reshape(batch_size, self.num_heads, evict_len, self.head_dim)
-            )
-        else:
-            evict_keys_expanded = evict_keys
-            evict_values_expanded = evict_values
-
-        # Compute attention scores: [batch, num_heads, 1, evict_len]
-        scores = torch.matmul(query, evict_keys_expanded.transpose(-2, -1)) * scale
-
-        # Select top-k: [batch, num_heads, 1, top_k]
-        _, topk_indices = torch.topk(
-            scores, k=actual_top_k, dim=-1, largest=True, sorted=False
+        block_size = vllm_config.cache_config.block_size
+        quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+        return SageAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+            head_size_v=self.head_size,
+            dtype=self.kv_cache_torch_dtype,
+            kv_quant_mode=quant_mode,
+            window_length=self.sage_config.window_length,
+            num_sink_tokens=self.sage_config.num_sink_tokens,
+            top_k=self.sage_config.top_k,
+            num_full_kv_layer=self.sage_config.num_full_kv_layer,
         )
-
-        # Expand indices for gathering: [batch, num_heads, top_k, head_dim]
-        topk_indices = topk_indices.squeeze(-2)  # [batch, num_heads, top_k]
-        gather_indices = topk_indices.unsqueeze(-1).expand(
-            batch_size, self.num_heads, actual_top_k, self.head_dim
-        )
-
-        # Gather top-k KV pairs
-        self.topk_key_cache = torch.gather(
-            evict_keys_expanded, dim=2, index=gather_indices
-        )
-        self.topk_value_cache = torch.gather(
-            evict_values_expanded, dim=2, index=gather_indices
-        )
-        self.topk_indices = topk_indices
-        self.topk_selected = True
-
-        logger.debug(
-            "SAGE: Selected top-%d from %d eviction candidates",
-            actual_top_k,
-            evict_len,
-        )
-
-    def get_combined_kv(
-        self,
-        main_keys: torch.Tensor,
-        main_values: torch.Tensor,
-        seq_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Get combined KV cache (main + top-k).
-
-        Args:
-            main_keys: Main KV cache keys [batch, num_kv_heads, seq_len, head_dim]
-            main_values: Main KV cache values
-            seq_len: Current sequence length
-
-        Returns:
-            Combined keys and values for attention
-        """
-        if self.topk_key_cache is None or not self.topk_selected:
-            return main_keys, main_values
-
-        # The main cache now contains [sink_tokens, recent_tokens]
-        # We need to insert top-k between sink and recent
-
-        batch_size = main_keys.shape[0]
-        num_sink = self.config.num_sink_tokens
-
-        # Extract sink and recent from main cache
-        # Main cache structure after eviction: [sink, recent, new]
-        main_len = main_keys.shape[2]
-        recent_len = main_len - num_sink
-
-        sink_keys = main_keys[:, :, :num_sink, :]
-        sink_values = main_values[:, :, :num_sink, :]
-        recent_keys = main_keys[:, :, num_sink:, :]
-        recent_values = main_values[:, :, num_sink:, :]
-
-        # Handle GQA for top-k cache
-        n_rep = self.num_heads // self.num_kv_heads
-        if n_rep > 1:
-            # Expand sink and recent to match top-k head count
-            sink_keys_exp = (
-                sink_keys[:, :, None, :, :]
-                .expand(batch_size, self.num_kv_heads, n_rep, num_sink, self.head_dim)
-                .reshape(batch_size, self.num_heads, num_sink, self.head_dim)
-            )
-
-            sink_values_exp = (
-                sink_values[:, :, None, :, :]
-                .expand(batch_size, self.num_kv_heads, n_rep, num_sink, self.head_dim)
-                .reshape(batch_size, self.num_heads, num_sink, self.head_dim)
-            )
-
-            recent_keys_exp = (
-                recent_keys[:, :, None, :, :]
-                .expand(batch_size, self.num_kv_heads, n_rep, recent_len, self.head_dim)
-                .reshape(batch_size, self.num_heads, recent_len, self.head_dim)
-            )
-
-            recent_values_exp = (
-                recent_values[:, :, None, :, :]
-                .expand(batch_size, self.num_kv_heads, n_rep, recent_len, self.head_dim)
-                .reshape(batch_size, self.num_heads, recent_len, self.head_dim)
-            )
-        else:
-            sink_keys_exp = sink_keys
-            sink_values_exp = sink_values
-            recent_keys_exp = recent_keys
-            recent_values_exp = recent_values
-
-        # Concatenate: [sink, top_k, recent]
-        combined_keys = torch.cat(
-            [sink_keys_exp, self.topk_key_cache, recent_keys_exp], dim=2
-        )
-        combined_values = torch.cat(
-            [sink_values_exp, self.topk_value_cache, recent_values_exp], dim=2
-        )
-
-        return combined_keys, combined_values
-
-    def reset(self) -> None:
-        """Reset cache state for new request."""
-        self.topk_key_cache = None
-        self.topk_value_cache = None
-        self.seen_tokens = 0
-        self.topk_selected = False
-        self.topk_indices = None
 
 
 class MiniMaxM2SageAttention(nn.Module):
@@ -400,9 +226,6 @@ class MiniMaxM2SageAttention(nn.Module):
 
         # SAGE configuration
         self.sage_config = sage_config or SageModelConfig()
-        self.use_sage = (
-            self.sage_config.enabled and layer_idx >= self.sage_config.num_full_kv_layer
-        )
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -433,8 +256,9 @@ class MiniMaxM2SageAttention(nn.Module):
             rope_parameters=rope_parameters,
         )
 
-        # Use standard vLLM Attention (SAGE logic is handled separately)
-        self.attn = Attention(
+        # SageAttention overrides get_kv_cache_spec to return
+        # SageAttentionSpec for SAGE layers (bounded by window_length).
+        self.attn = SageAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
@@ -443,6 +267,8 @@ class MiniMaxM2SageAttention(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            sage_config=self.sage_config,
+            layer_idx=layer_idx,
         )
 
         self.q_norm = MiniMaxText01RMSNormTP(
@@ -568,23 +394,14 @@ class MiniMaxM2SageModel(nn.Module):
             self.sage_config = SageModelConfig.from_hf_config(config)
             logger.info("Using SAGE config from model config.json")
 
-        # Print prominent SAGE initialization message
-        print("=" * 60)
-        print("SAGE MODEL INITIALIZED: MiniMaxM2SageForCausalLM")
-        print("=" * 60)
-        print(f"  SAGE Enabled: {self.sage_config.enabled}")
-        print(f"  Window Length: {self.sage_config.window_length}")
-        print(f"  Sink Tokens: {self.sage_config.num_sink_tokens}")
-        print(f"  Top-K: {self.sage_config.top_k}")
-        print(f"  Full KV Layers: {self.sage_config.num_full_kv_layer}")
-        print(f"  Recent Window: {self.sage_config.recent_window_size}")
-        print("=" * 60)
-
         logger.info(
-            "MiniMax M2 SAGE Model: window=%d, sink=%d, top_k=%d",
+            "SAGE MODEL INITIALIZED: window=%d  sink=%d  top_k=%d  "
+            "full_kv_layers=%d  recent=%d",
             self.sage_config.window_length,
             self.sage_config.num_sink_tokens,
             self.sage_config.top_k,
+            self.sage_config.num_full_kv_layer,
+            self.sage_config.recent_window_size,
         )
 
         self.vocab_size = config.vocab_size
@@ -600,13 +417,13 @@ class MiniMaxM2SageModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         # Create layers with SAGE configuration
-        def make_layer(layer_prefix: str) -> MiniMaxM2SageDecoderLayer:
+        def make_layer(prefix: str) -> MiniMaxM2SageDecoderLayer:
             # Extract layer index from prefix
-            layer_idx = int(layer_prefix.split(".")[-1])
+            layer_idx = int(prefix.split(".")[-1])
             return MiniMaxM2SageDecoderLayer(
                 config,
                 layer_idx=layer_idx,
-                prefix=layer_prefix,
+                prefix=prefix,
                 model_config=model_config,
                 cache_config=cache_config,
                 quant_config=quant_config,
@@ -626,6 +443,9 @@ class MiniMaxM2SageModel(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
 
     def forward(
         self,
@@ -789,6 +609,9 @@ class MiniMaxM2SageForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
 
     def forward(
         self,

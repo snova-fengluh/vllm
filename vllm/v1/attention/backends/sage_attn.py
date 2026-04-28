@@ -310,9 +310,14 @@ class SageAttentionMetadataBuilder(AttentionMetadataBuilder[SageAttentionMetadat
             self.state_registry.prune(active_ids)
 
         device = query_start_loc.device
-        is_long_context = torch.tensor(is_long_list, dtype=torch.bool, device=device)
+        # Keep these on CPU – they are only used for Python-level control flow
+        # (branching / indexing), never for GPU computation.  Placing them on
+        # GPU would cause illegal device-to-host syncs during CUDA graph
+        # capture (`.any().item()` in forward()).
+        is_long_context = torch.tensor(is_long_list, dtype=torch.bool,
+                                       device="cpu")
         is_first_long_decode = torch.tensor(
-            is_first_long_list, dtype=torch.bool, device=device
+            is_first_long_list, dtype=torch.bool, device="cpu"
         )
 
         return SageAttentionMetadata(

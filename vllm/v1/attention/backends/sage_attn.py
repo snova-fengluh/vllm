@@ -192,7 +192,11 @@ class SageAttentionMetadata:
 class SageAttentionMetadataBuilder(AttentionMetadataBuilder[SageAttentionMetadata]):
     """Builder for SAGE attention metadata."""
 
-    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+    # SAGE requires dynamic execution for long-context decodes (variable dense
+    # KV sizes, top-k selection, etc.), so we disable CUDA graphs entirely.
+    # This has some performance impact for short-context batches, but is
+    # necessary for SAGE to function correctly.
+    _cudagraph_support = AttentionCGSupport.NEVER
     supports_update_block_table: bool = True
 
     @classmethod
@@ -309,15 +313,40 @@ class SageAttentionMetadataBuilder(AttentionMetadataBuilder[SageAttentionMetadat
         if active_ids:
             self.state_registry.prune(active_ids)
 
-        device = query_start_loc.device
         # Keep these on CPU – they are only used for Python-level control flow
         # (branching / indexing), never for GPU computation.  Placing them on
         # GPU would cause illegal device-to-host syncs during CUDA graph
         # capture (`.any().item()` in forward()).
-        is_long_context = torch.tensor(is_long_list, dtype=torch.bool,
-                                       device="cpu")
+        is_long_context = torch.tensor(is_long_list, dtype=torch.bool, device="cpu")
         is_first_long_decode = torch.tensor(
             is_first_long_list, dtype=torch.bool, device="cpu"
+        )
+
+        # Debug logging
+        num_long = sum(is_long_list)
+        num_first_long = sum(is_first_long_list)
+
+        # Get actual seq_len values for debugging
+        seq_lens_list = []
+        for i in range(min(num_reqs, 5)):  # Show first 5
+            seq_len_i = (
+                int(seq_lens[i].item())
+                if seq_lens.is_cpu
+                else int(seq_lens.cpu()[i].item())
+            )
+            seq_lens_list.append(seq_len_i)
+
+        logger.info(
+            "[SAGE-BUILD] num_reqs=%d, max_query_len=%d, max_seq_len=%d, "
+            "num_long_context=%d, num_first_long_decode=%d, "
+            "sage_window_length=%d, first_seq_lens=%s",
+            num_reqs,
+            max_query_len,
+            max_seq_len,
+            num_long,
+            num_first_long,
+            self.sage_window_length,
+            seq_lens_list,
         )
 
         return SageAttentionMetadata(
@@ -342,6 +371,37 @@ class SageAttentionMetadataBuilder(AttentionMetadataBuilder[SageAttentionMetadat
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _repeat_kv(keys: torch.Tensor, values: torch.Tensor, n_rep: int
+               ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand KV from kv_heads to query_heads by repeating.
+
+    This is the standard GQA expansion: each KV head is repeated n_rep times
+    to match the number of query heads.
+
+    Args:
+        keys: [seq_len, num_kv_heads, head_dim]
+        values: [seq_len, num_kv_heads, head_dim]
+        n_rep: number of times to repeat (num_query_heads // num_kv_heads)
+
+    Returns:
+        (keys, values) each [seq_len, num_query_heads, head_dim]
+    """
+    if n_rep == 1:
+        return keys, values
+
+    seq_len, num_kv_heads, head_dim = keys.shape
+    # [seq_len, num_kv_heads, head_dim] -> [seq_len, num_kv_heads, 1, head_dim]
+    keys = keys.unsqueeze(2)
+    values = values.unsqueeze(2)
+    # Expand and reshape: [seq_len, num_kv_heads, n_rep, head_dim]
+    #                  -> [seq_len, num_kv_heads * n_rep, head_dim]
+    keys = keys.expand(seq_len, num_kv_heads, n_rep, head_dim)
+    values = values.expand(seq_len, num_kv_heads, n_rep, head_dim)
+    keys = keys.reshape(seq_len, num_kv_heads * n_rep, head_dim)
+    values = values.reshape(seq_len, num_kv_heads * n_rep, head_dim)
+    return keys.contiguous(), values.contiguous()
 
 
 def _gather_paged_kv(
@@ -373,43 +433,62 @@ def _gather_paged_kv(
     return gathered_keys, gathered_values
 
 
-def _topk_select_for_row(
+def _topk_select_query_head_level(
     query_row: torch.Tensor,
     candidate_keys: torch.Tensor,
+    candidate_values: torch.Tensor,
     top_k: int,
     scale: float,
-    num_queries_per_kv: int,
-) -> torch.Tensor:
-    """Compute top-k indices for one decode row.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute top-k K/V for one decode row at query head level.
+
+    Following the sambaLLMs SAGE implementation, we do top-k selection at the
+    query head level (not KV head level). Each query head independently selects
+    its own top-k tokens. This is important for GQA models where different
+    query heads may find different tokens important.
 
     Args:
-        query_row: [num_heads, head_dim]  (num_heads = num_q_heads)
-        candidate_keys: [num_candidates, num_kv_heads, head_dim]
-        top_k: number of indices to select per KV head.
-        scale: softmax scale.
-        num_queries_per_kv: GQA ratio (num_heads // num_kv_heads).
+        query_row: [num_query_heads, head_dim]
+        candidate_keys: [num_candidates, num_query_heads, head_dim]
+            (already expanded from KV heads)
+        candidate_values: [num_candidates, num_query_heads, head_dim]
+            (already expanded from KV heads)
+        top_k: number of tokens to select per query head
+        scale: softmax scale
 
     Returns:
-        indices: [num_kv_heads, top_k] int64
+        (topk_keys, topk_values) each [num_query_heads, top_k, head_dim]
     """
-    num_kv_heads = candidate_keys.shape[1]
-    head_dim = candidate_keys.shape[2]
+    num_candidates, num_query_heads, head_dim = candidate_keys.shape
 
-    # Reshape query to [num_kv_heads, num_q_per_kv, head_dim]
-    q = query_row.view(num_kv_heads, num_queries_per_kv, head_dim)
+    # query_row: [num_query_heads, head_dim] -> [num_query_heads, 1, head_dim]
+    q = query_row.unsqueeze(1)
 
-    # candidate_keys: [N, num_kv_heads, head_dim] → [num_kv_heads, N, head_dim]
-    k = candidate_keys.permute(1, 0, 2)  # [H_kv, N, D]
+    # candidate_keys: [N, H_q, D] -> [H_q, N, D]
+    k = candidate_keys.permute(1, 0, 2)
 
-    # scores: [H_kv, num_q_per_kv, N] = einsum("hqd,hnd->hqn", q, k)
-    scores = torch.einsum("hqd,hnd->hqn", q, k) * scale
+    # scores: [H_q, 1, N] = bmm(q, k.T)
+    # q: [H_q, 1, D], k.T: [H_q, D, N] -> [H_q, 1, N]
+    scores = torch.bmm(q, k.transpose(1, 2)) * scale
+    scores = scores.squeeze(1)  # [H_q, N]
 
-    # GQA reduce: sum over query-heads-per-kv-head → [H_kv, N]
-    scores = scores.sum(dim=1)
-
-    actual_k = min(top_k, scores.shape[-1])
+    actual_k = min(top_k, num_candidates)
     _, indices = torch.topk(scores, k=actual_k, dim=-1, sorted=False)
-    return indices  # [num_kv_heads, actual_k]
+    # indices: [H_q, actual_k]
+
+    # Gather top-k keys and values for each query head
+    # indices: [H_q, actual_k] -> [H_q, actual_k, 1] for gather
+    indices_expanded = indices.unsqueeze(-1).expand(-1, -1, head_dim)
+
+    # Permute candidates to [H_q, N, D] for gather
+    k_for_gather = candidate_keys.permute(1, 0, 2)  # [H_q, N, D]
+    v_for_gather = candidate_values.permute(1, 0, 2)  # [H_q, N, D]
+
+    # Gather: [H_q, actual_k, D]
+    topk_keys = torch.gather(k_for_gather, dim=1, index=indices_expanded)
+    topk_values = torch.gather(v_for_gather, dim=1, index=indices_expanded)
+
+    return topk_keys, topk_values  # [num_query_heads, top_k, head_dim]
 
 
 # ---------------------------------------------------------------------------
@@ -532,13 +611,46 @@ class SageAttentionImpl(AttentionImpl):
             and attn_metadata.is_long_context.any().item()
         )
 
+        # Get layer index for conditional logging (only log on layer 0)
+        layer_idx = getattr(layer, "_layer_index", 0)
+
         if not has_long_decode:
             # ---- Standard FlashAttention path (prefill, short decode) ----
+            if layer_idx == 0:
+                # Determine why SAGE path was not taken
+                if attn_metadata.max_query_len > 1:
+                    reason = "prefill"
+                else:
+                    reason = "short_context"
+                if attn_metadata.is_long_context is not None:
+                    any_long = attn_metadata.is_long_context.any().item()
+                else:
+                    any_long = False
+                logger.info(
+                    "[SAGE-FORWARD] Standard FA path (reason=%s): "
+                    "query.shape=%s, max_query_len=%d, max_seq_len=%d, "
+                    "any_long_context=%s, window_length=%d",
+                    reason,
+                    tuple(query.shape),
+                    attn_metadata.max_query_len,
+                    attn_metadata.max_seq_len,
+                    any_long,
+                    self.sage_window_length,
+                )
             return self._flash_attn_forward(
                 layer, query, kv_cache, attn_metadata, output
             )
 
         # ---- Mixed batch: some rows need SAGE, others are standard ----
+        if layer_idx == 0:
+            num_long = attn_metadata.is_long_context.sum().item()
+            logger.info(
+                "[SAGE-FORWARD] SAGE mixed path: query.shape=%s, "
+                "num_reqs=%d, num_long_context=%d",
+                tuple(query.shape),
+                attn_metadata.seq_lens.shape[0],
+                num_long,
+            )
         return self._sage_mixed_forward(layer, query, kv_cache, attn_metadata, output)
 
     # ---- Standard FA path ----
@@ -699,78 +811,184 @@ class SageAttentionImpl(AttentionImpl):
         is_first_long: bool,
         output_row: torch.Tensor,
     ) -> None:
-        """Run SAGE decode for a single long-context row."""
+        """Run SAGE decode for a single long-context row.
+
+        Following the sambaLLMs SAGE implementation:
+        1. Top-k selection is done at QUERY HEAD level (not KV head level)
+        2. Each query head independently selects its top-k important tokens
+        3. Top-k K/V tensors are stored at query head level
+        4. Final dense K/V is at query head level with exactly window_length tokens
+
+        This ensures that:
+        - Different query heads in the same GQA group can select different tokens
+        - The total K/V size is always exactly window_length (sink + top_k + recent)
+        """
         num_sink = self.sage_num_sink_tokens
         recent = self.sage_recent_window
         top_k = self.sage_top_k
         block_size = kv_cache.shape[2]  # [2, num_blocks, block_size, ...]
         device = query_row.device
 
+        # Only log on layer 0 to avoid redundant output across all layers
+        if layer_idx == 0:
+            logger.info(
+                "[SAGE-DECODE-ROW] seq_len=%d, is_first_long=%s, "
+                "query_row.shape=%s, block_table_row.shape=%s, "
+                "num_query_heads=%d, num_kv_heads=%d",
+                seq_len,
+                is_first_long,
+                tuple(query_row.shape),
+                tuple(block_table_row.shape),
+                self.num_heads,
+                self.num_kv_heads,
+            )
+
         # --- Top-k selection (once per request at prefill→decode edge) ---
+        # Following sambaLLMs: select top-k at query head level
         if (
             is_first_long
             and state is not None
-            and layer_idx not in state.topk_indices_per_layer
+            and layer_idx not in state.topk_keys_per_layer
         ):
             # Gather candidate KV: tokens [num_sink .. seq_len - recent]
             cand_start = num_sink
             cand_end = seq_len - recent
-            if cand_end > cand_start:
+            num_candidates = max(0, cand_end - cand_start)
+
+            if layer_idx == 0:
+                logger.info(
+                    "[SAGE-TOPK-SELECT] cand_range=[%d:%d], num_candidates=%d, "
+                    "top_k=%d, selecting at query head level",
+                    cand_start,
+                    cand_end,
+                    num_candidates,
+                    top_k,
+                )
+
+            if num_candidates > 0:
                 cand_indices = torch.arange(
                     cand_start, cand_end, dtype=torch.int64, device=device
                 )
-                cand_keys, _ = _gather_paged_kv(
+                # Gather at KV head level: [num_candidates, num_kv_heads, head_dim]
+                cand_keys, cand_values = _gather_paged_kv(
                     kv_cache, block_table_row, cand_indices, block_size
                 )
-                # cand_keys: [N_cand, num_kv_heads, head_dim]
-                indices = _topk_select_for_row(
-                    query_row, cand_keys, top_k, self.scale, self.num_queries_per_kv
-                )
-                # indices: [num_kv_heads, actual_k] – these are offsets into
-                # cand_indices, so map back to absolute positions.
-                abs_indices = cand_indices[indices]  # broadcast gather
-                state.topk_indices_per_layer[layer_idx] = abs_indices
 
-        # --- Build dense KV = [sink] + [topk] + [recent] ---
+                # Expand to query head level for top-k selection
+                # [num_candidates, num_kv_heads, dim] -> [num_candidates, num_q_heads, dim]
+                cand_keys_expanded, cand_values_expanded = _repeat_kv(
+                    cand_keys, cand_values, self.num_queries_per_kv
+                )
+
+                # Select top-k at query head level
+                # Returns: [num_query_heads, top_k, head_dim]
+                topk_keys, topk_values = _topk_select_query_head_level(
+                    query_row,
+                    cand_keys_expanded,
+                    cand_values_expanded,
+                    top_k,
+                    self.scale,
+                )
+
+                # Store at query head level
+                state.topk_keys_per_layer[layer_idx] = topk_keys
+                state.topk_values_per_layer[layer_idx] = topk_values
+
+                if layer_idx == 0:
+                    logger.info(
+                        "[SAGE-TOPK-SELECT] cand_keys.shape=%s, "
+                        "cand_keys_expanded.shape=%s, "
+                        "topk_keys.shape=%s (per query head)",
+                        tuple(cand_keys.shape),
+                        tuple(cand_keys_expanded.shape),
+                        tuple(topk_keys.shape),
+                    )
+            else:
+                # No candidates to select from (edge case)
+                head_dim = self.head_size
+                state.topk_keys_per_layer[layer_idx] = torch.empty(
+                    (self.num_heads, 0, head_dim), device=device, dtype=query_row.dtype
+                )
+                state.topk_values_per_layer[layer_idx] = torch.empty(
+                    (self.num_heads, 0, head_dim), device=device, dtype=query_row.dtype
+                )
+
+        # --- Build dense KV at query head level ---
+        # Structure: [sink_tokens] + [topk_tokens] + [recent_tokens]
+        # All at query head level: [window_length, num_query_heads, head_dim]
+
+        # 1. Gather sink tokens at KV head level, then expand
         sink_indices = torch.arange(0, num_sink, dtype=torch.int64, device=device)
-        # recent window: last (recent - 1) tokens before the current one.
+        sink_keys, sink_values = _gather_paged_kv(
+            kv_cache, block_table_row, sink_indices, block_size
+        )
+        # Expand to query heads: [num_sink, num_query_heads, head_dim]
+        sink_keys, sink_values = _repeat_kv(
+            sink_keys, sink_values, self.num_queries_per_kv
+        )
+
+        # 2. Gather recent tokens at KV head level, then expand
         recent_start = max(seq_len - recent, num_sink)
         recent_indices = torch.arange(
             recent_start, seq_len, dtype=torch.int64, device=device
         )
-
-        # Collect topk indices (per KV head).  For the dense tensor we need
-        # a single flat set of token positions.  Merge all KV-head indices.
-        if state is not None and layer_idx in state.topk_indices_per_layer:
-            topk_idx = state.topk_indices_per_layer[layer_idx]
-            # topk_idx: [num_kv_heads, actual_k] – flatten and unique
-            topk_flat = topk_idx.reshape(-1).unique()
-        else:
-            topk_flat = torch.empty(0, dtype=torch.int64, device=device)
-
-        # Merge all indices and de-duplicate while preserving order.
-        all_indices = torch.cat([sink_indices, topk_flat, recent_indices])
-        all_indices = all_indices.unique(sorted=True)
-
-        dense_keys, dense_values = _gather_paged_kv(
-            kv_cache, block_table_row, all_indices, block_size
+        recent_keys, recent_values = _gather_paged_kv(
+            kv_cache, block_table_row, recent_indices, block_size
         )
-        # dense_keys: [window_len, num_kv_heads, head_dim]
+        # Expand to query heads: [num_recent, num_query_heads, head_dim]
+        recent_keys, recent_values = _repeat_kv(
+            recent_keys, recent_values, self.num_queries_per_kv
+        )
+
+        # 3. Get stored top-k K/V (already at query head level)
+        if state is not None and layer_idx in state.topk_keys_per_layer:
+            # topk: [num_query_heads, top_k, head_dim]
+            topk_keys = state.topk_keys_per_layer[layer_idx]
+            topk_values = state.topk_values_per_layer[layer_idx]
+            # Transpose to [top_k, num_query_heads, head_dim] for concatenation
+            topk_keys = topk_keys.transpose(0, 1)
+            topk_values = topk_values.transpose(0, 1)
+        else:
+            # No top-k available (shouldn't happen in normal flow)
+            topk_keys = torch.empty(
+                (0, self.num_heads, self.head_size),
+                device=device,
+                dtype=query_row.dtype,
+            )
+            topk_values = torch.empty(
+                (0, self.num_heads, self.head_size),
+                device=device,
+                dtype=query_row.dtype,
+            )
+
+        # 4. Concatenate: [sink] + [topk] + [recent] at query head level
+        # Each tensor is [seq_portion, num_query_heads, head_dim]
+        dense_keys = torch.cat([sink_keys, topk_keys, recent_keys], dim=0)
+        dense_values = torch.cat([sink_values, topk_values, recent_values], dim=0)
 
         window_len = dense_keys.shape[0]
 
-        # Run FlashAttention on the dense KV (single-sequence).
-        cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        if layer_idx == 0:
+            logger.info(
+                "[SAGE-DENSE-KV] sink=%d, topk=%d, recent=%d, "
+                "window_len=%d (should equal %d), dense_keys.shape=%s",
+                len(sink_indices),
+                topk_keys.shape[0],
+                len(recent_indices),
+                window_len,
+                self.sage_window_length,
+                tuple(dense_keys.shape),
+            )
 
-        # We need to expand dense KV from [window_len, num_kv_heads, head_dim]
-        # to block-table format or use the non-paged varlen interface.
-        # The simplest path: pass dense K/V directly (no block_table).
+        # Run FlashAttention on the dense KV (single-sequence, non-paged).
+        # K/V are at query head level, so this is MHA (not GQA).
+        cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        cu_seqlens_k = torch.tensor([0, window_len], dtype=torch.int32, device=device)
 
         # query_row: [num_heads, head_dim] → [1, num_heads, head_dim]
         q = query_row.unsqueeze(0)
 
-        # FlashAttention expects k, v as contiguous [num_tokens, num_kv_heads, head_dim]
-        # when block_table is not provided.
+        # K/V: [window_len, num_query_heads, head_dim] - same head count as Q
         out_buf = output_row.unsqueeze(0)  # [1, num_heads, head_dim]
 
         flash_attn_varlen_func(
@@ -780,7 +998,7 @@ class SageAttentionImpl(AttentionImpl):
             out=out_buf,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=1,
-            seqused_k=torch.tensor([window_len], dtype=torch.int32, device=device),
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_k=window_len,
             softmax_scale=self.scale,
             causal=False,  # not causal – positions are non-contiguous
@@ -790,3 +1008,12 @@ class SageAttentionImpl(AttentionImpl):
             softcap=self.logits_soft_cap,
             fa_version=self.vllm_flash_attn_version,
         )
+
+        if layer_idx == 0:
+            logger.info(
+                "[SAGE-DECODE-DONE] Completed SAGE decode: q.shape=%s, "
+                "k.shape=%s, window_len=%d (logged for layer 0 only)",
+                tuple(q.shape),
+                tuple(dense_keys.shape),
+                window_len,
+            )

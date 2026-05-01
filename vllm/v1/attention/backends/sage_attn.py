@@ -563,6 +563,28 @@ class SageAttentionImpl(AttentionImpl):
             self.sage_window_length - self.sage_num_sink_tokens - self.sage_top_k
         )
 
+        # Lazy-initialized cached tensors (set on first forward call when
+        # device/dtype are known).  Avoids thousands of redundant tensor
+        # allocations per decode step.
+        self._cached_tensors_ready = False
+
+    def _init_cached_tensors(self, device: torch.device,
+                             dtype: torch.dtype) -> None:
+        """One-time allocation of tensors that never change between steps."""
+        num_sink = self.sage_num_sink_tokens
+        # Sink token positions: always [0, 1, ..., num_sink-1]
+        self._cached_sink_indices = torch.arange(
+            num_sink, dtype=torch.int64, device=device)
+        # cu_seqlens_q for a single-token query
+        self._cached_cu_seqlens_q_one = torch.tensor(
+            [0, 1], dtype=torch.int32, device=device)
+        # Pre-compute sink block / slot decomposition
+        block_size = None  # filled on first actual use (needs kv_cache shape)
+        self._cached_sink_block_size = block_size
+        self._cached_device = device
+        self._cached_dtype = dtype
+        self._cached_tensors_ready = True
+
     # ---- KV cache update (called by runner before forward) ----
 
     def do_kv_cache_update(
@@ -694,7 +716,7 @@ class SageAttentionImpl(AttentionImpl):
         )
         return output
 
-    # ---- SAGE mixed path ----
+    # ---- SAGE mixed path (batched) ----
 
     def _sage_mixed_forward(
         self,
@@ -704,316 +726,318 @@ class SageAttentionImpl(AttentionImpl):
         attn_metadata: SageAttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Handle a batch mixing standard and SAGE rows."""
-        num_reqs = attn_metadata.seq_lens.shape[0]
+        """Handle a decode batch mixing standard and SAGE rows.
+
+        Instead of iterating per-row (which causes O(num_reqs) GPU→CPU syncs
+        and O(num_reqs × num_layers) kernel launches), this method partitions
+        the batch into standard and SAGE groups and issues **one** FA kernel
+        call per group.
+        """
         assert attn_metadata.is_long_context is not None
         assert attn_metadata.request_states is not None
-        query_start_loc = attn_metadata.query_start_loc
-
-        # Detect the layer index from the layer's prefix (set by Attention).
+        device = query.device
         layer_idx = getattr(layer, "_layer_index", 0)
 
-        # Process each row.  For a decode-only batch every row has q_len = 1,
-        # so query[i] is the i-th row's single query token.
-        for i in range(num_reqs):
-            q_start = int(query_start_loc[i].item())
-            q_end = int(query_start_loc[i + 1].item())
-            q_len = q_end - q_start
+        # Lazy-init cached tensors on first call.
+        if not self._cached_tensors_ready:
+            self._init_cached_tensors(device, query.dtype)
 
-            if q_len != 1 or not attn_metadata.is_long_context[i]:
-                # Prefill or short-context decode → standard FA for this row.
-                self._standard_row(
-                    layer,
-                    query,
-                    kv_cache,
-                    attn_metadata,
-                    output,
-                    row_idx=i,
-                    q_start=q_start,
-                    q_end=q_end,
-                )
-                continue
+        # --- Partition rows (CPU, no GPU sync) ---
+        # is_long_context lives on CPU (see builder).
+        sage_mask = attn_metadata.is_long_context  # [num_reqs] bool, CPU
+        std_mask = ~sage_mask
+        sage_row_cpu = sage_mask.nonzero(as_tuple=True)[0]  # CPU int64
+        std_row_cpu = std_mask.nonzero(as_tuple=True)[0]
 
-            # Long-context decode → SAGE path.
-            state = attn_metadata.request_states[i]
-            seq_len = int(attn_metadata.seq_lens[i].item())
-            block_table_row = attn_metadata.block_table[i]
+        N_sage = sage_row_cpu.shape[0]
+        N_std = std_row_cpu.shape[0]
 
-            self._sage_decode_one_row(
-                layer=layer,
-                query_row=query[q_start],  # [num_heads, head_dim]
-                kv_cache=kv_cache,
-                block_table_row=block_table_row,
-                seq_len=seq_len,
-                state=state,
-                layer_idx=layer_idx,
-                is_first_long=(
-                    attn_metadata.is_first_long_decode is not None
-                    and attn_metadata.is_first_long_decode[i].item()
-                ),
-                output_row=output[q_start],  # [num_heads, head_dim]
-            )
+        # --- Standard (short-context) rows: one batched paged-FA call ---
+        if N_std > 0:
+            self._batched_standard_decode(
+                layer, query, kv_cache, attn_metadata, output,
+                std_row_cpu, N_std)
+
+        # --- First-long-decode top-k selection (rare, per-row) ---
+        if (attn_metadata.is_first_long_decode is not None
+                and attn_metadata.is_first_long_decode.any()):
+            block_size = kv_cache.shape[2]
+            for idx in range(N_sage):
+                row_i = int(sage_row_cpu[idx])
+                if not attn_metadata.is_first_long_decode[row_i]:
+                    continue
+                self._compute_topk_for_row(
+                    query, kv_cache, attn_metadata, row_i,
+                    layer_idx, block_size, device)
+
+        # --- SAGE (long-context) rows: batched gather + dense FA ---
+        if N_sage > 0:
+            self._batched_sage_decode(
+                layer, query, kv_cache, attn_metadata, output,
+                sage_row_cpu, N_sage, layer_idx)
 
         return output
 
-    def _standard_row(
+    # ---- Batched standard decode ----
+
+    def _batched_standard_decode(
         self,
         layer: torch.nn.Module,
         query: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: SageAttentionMetadata,
         output: torch.Tensor,
-        row_idx: int,
-        q_start: int,
-        q_end: int,
+        std_row_cpu: torch.Tensor,
+        N_std: int,
     ) -> None:
-        """Run standard FlashAttention for a single row (slice of batch)."""
+        """One FA kernel call for all short-context decode rows."""
+        device = query.device
         key_cache, value_cache = kv_cache.unbind(0)
-        q_len = q_end - q_start
 
-        cu_seqlens_q = torch.tensor([0, q_len], dtype=torch.int32, device=query.device)
-        seq_used_k = attn_metadata.seq_lens[row_idx : row_idx + 1]
-        block_table = attn_metadata.block_table[row_idx : row_idx + 1]
+        std_gpu = std_row_cpu.to(device, dtype=torch.long, non_blocking=True)
 
-        descale_shape = (1, self.num_kv_heads)
+        q_std = query[std_gpu]  # [N_std, num_heads, head_dim]
+        seq_lens_std = attn_metadata.seq_lens[std_gpu]
+        block_table_std = attn_metadata.block_table[std_gpu]
+
+        cu_seqlens_q = torch.arange(
+            0, N_std + 1, dtype=torch.int32, device=device)
+        max_seqlen_k = int(seq_lens_std.max().item())
+
+        descale_shape = (N_std, self.num_kv_heads)
         k_descale = layer._k_scale.expand(descale_shape)
         v_descale = layer._v_scale.expand(descale_shape)
 
+        out_std = torch.empty_like(q_std)
         flash_attn_varlen_func(
-            q=query[q_start:q_end],
+            q=q_std,
             k=key_cache,
             v=value_cache,
-            out=output[q_start:q_end],
+            out=out_std,
             cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=q_len,
-            seqused_k=seq_used_k,
-            max_seqlen_k=int(seq_used_k.item()),
+            max_seqlen_q=1,
+            seqused_k=seq_lens_std,
+            max_seqlen_k=max_seqlen_k,
             softmax_scale=self.scale,
             causal=attn_metadata.causal,
             alibi_slopes=None,
             window_size=list(self.sliding_window),
-            block_table=block_table,
+            block_table=block_table_std,
             softcap=self.logits_soft_cap,
             fa_version=self.vllm_flash_attn_version,
             k_descale=k_descale,
             v_descale=v_descale,
         )
+        output[std_gpu] = out_std
 
-    def _sage_decode_one_row(
+    # ---- Top-k selection (once per request, at prefill→decode edge) ----
+
+    def _compute_topk_for_row(
         self,
-        layer: torch.nn.Module,
-        query_row: torch.Tensor,
+        query: torch.Tensor,
         kv_cache: torch.Tensor,
-        block_table_row: torch.Tensor,
-        seq_len: int,
-        state: SageRequestState | None,
+        attn_metadata: SageAttentionMetadata,
+        row_i: int,
         layer_idx: int,
-        is_first_long: bool,
-        output_row: torch.Tensor,
+        block_size: int,
+        device: torch.device,
     ) -> None:
-        """Run SAGE decode for a single long-context row.
+        """Compute and store top-k KV for a single first-long-decode row."""
+        state = attn_metadata.request_states[row_i]
+        if state is None or layer_idx in state.topk_keys_per_layer:
+            return
 
-        Following the sambaLLMs SAGE implementation:
-        1. Top-k selection is done at QUERY HEAD level (not KV head level)
-        2. Each query head independently selects its top-k important tokens
-        3. Top-k K/V tensors are stored at query head level
-        4. Final dense K/V is at query head level with exactly window_length tokens
+        seq_len = int(attn_metadata.seq_lens[row_i].item())
+        block_table_row = attn_metadata.block_table[row_i]
+        query_row = query[row_i]  # [num_heads, head_dim] (decode: q_len=1)
 
-        This ensures that:
-        - Different query heads in the same GQA group can select different tokens
-        - The total K/V size is always exactly window_length (sink + top_k + recent)
-        """
         num_sink = self.sage_num_sink_tokens
         recent = self.sage_recent_window
         top_k = self.sage_top_k
-        block_size = kv_cache.shape[2]  # [2, num_blocks, block_size, ...]
-        device = query_row.device
 
-        # Only log on layer 0 to avoid redundant output across all layers
+        cand_start = num_sink
+        cand_end = seq_len - recent
+        num_candidates = max(0, cand_end - cand_start)
+
         if layer_idx == 0:
             logger.info(
-                "[SAGE-DECODE-ROW] seq_len=%d, is_first_long=%s, "
-                "query_row.shape=%s, block_table_row.shape=%s, "
-                "num_query_heads=%d, num_kv_heads=%d",
-                seq_len,
-                is_first_long,
-                tuple(query_row.shape),
-                tuple(block_table_row.shape),
-                self.num_heads,
-                self.num_kv_heads,
+                "[SAGE-TOPK-SELECT] row=%d, cand_range=[%d:%d], "
+                "num_candidates=%d, top_k=%d",
+                row_i, cand_start, cand_end, num_candidates, top_k,
             )
 
-        # --- Top-k selection (once per request at prefill→decode edge) ---
-        # Following sambaLLMs: select top-k at query head level
-        if (
-            is_first_long
-            and state is not None
-            and layer_idx not in state.topk_keys_per_layer
-        ):
-            # Gather candidate KV: tokens [num_sink .. seq_len - recent]
-            cand_start = num_sink
-            cand_end = seq_len - recent
-            num_candidates = max(0, cand_end - cand_start)
-
-            if layer_idx == 0:
-                logger.info(
-                    "[SAGE-TOPK-SELECT] cand_range=[%d:%d], num_candidates=%d, "
-                    "top_k=%d, selecting at query head level",
-                    cand_start,
-                    cand_end,
-                    num_candidates,
-                    top_k,
-                )
-
-            if num_candidates > 0:
-                cand_indices = torch.arange(
-                    cand_start, cand_end, dtype=torch.int64, device=device
-                )
-                # Gather at KV head level: [num_candidates, num_kv_heads, head_dim]
-                cand_keys, cand_values = _gather_paged_kv(
-                    kv_cache, block_table_row, cand_indices, block_size
-                )
-
-                # Expand to query head level for top-k selection
-                # [num_candidates, num_kv_heads, dim] -> [num_candidates, num_q_heads, dim]
-                cand_keys_expanded, cand_values_expanded = _repeat_kv(
-                    cand_keys, cand_values, self.num_queries_per_kv
-                )
-
-                # Select top-k at query head level
-                # Returns: [num_query_heads, top_k, head_dim]
-                topk_keys, topk_values = _topk_select_query_head_level(
-                    query_row,
-                    cand_keys_expanded,
-                    cand_values_expanded,
-                    top_k,
-                    self.scale,
-                )
-
-                # Store at query head level
-                state.topk_keys_per_layer[layer_idx] = topk_keys
-                state.topk_values_per_layer[layer_idx] = topk_values
-
-                if layer_idx == 0:
-                    logger.info(
-                        "[SAGE-TOPK-SELECT] cand_keys.shape=%s, "
-                        "cand_keys_expanded.shape=%s, "
-                        "topk_keys.shape=%s (per query head)",
-                        tuple(cand_keys.shape),
-                        tuple(cand_keys_expanded.shape),
-                        tuple(topk_keys.shape),
-                    )
-            else:
-                # No candidates to select from (edge case)
-                head_dim = self.head_size
-                state.topk_keys_per_layer[layer_idx] = torch.empty(
-                    (self.num_heads, 0, head_dim), device=device, dtype=query_row.dtype
-                )
-                state.topk_values_per_layer[layer_idx] = torch.empty(
-                    (self.num_heads, 0, head_dim), device=device, dtype=query_row.dtype
-                )
-
-        # --- Build dense KV at query head level ---
-        # Structure: [sink_tokens] + [topk_tokens] + [recent_tokens]
-        # All at query head level: [window_length, num_query_heads, head_dim]
-
-        # 1. Gather sink tokens at KV head level, then expand
-        sink_indices = torch.arange(0, num_sink, dtype=torch.int64, device=device)
-        sink_keys, sink_values = _gather_paged_kv(
-            kv_cache, block_table_row, sink_indices, block_size
-        )
-        # Expand to query heads: [num_sink, num_query_heads, head_dim]
-        sink_keys, sink_values = _repeat_kv(
-            sink_keys, sink_values, self.num_queries_per_kv
-        )
-
-        # 2. Gather recent tokens at KV head level, then expand
-        recent_start = max(seq_len - recent, num_sink)
-        recent_indices = torch.arange(
-            recent_start, seq_len, dtype=torch.int64, device=device
-        )
-        recent_keys, recent_values = _gather_paged_kv(
-            kv_cache, block_table_row, recent_indices, block_size
-        )
-        # Expand to query heads: [num_recent, num_query_heads, head_dim]
-        recent_keys, recent_values = _repeat_kv(
-            recent_keys, recent_values, self.num_queries_per_kv
-        )
-
-        # 3. Get stored top-k K/V (already at query head level)
-        if state is not None and layer_idx in state.topk_keys_per_layer:
-            # topk: [num_query_heads, top_k, head_dim]
-            topk_keys = state.topk_keys_per_layer[layer_idx]
-            topk_values = state.topk_values_per_layer[layer_idx]
-            # Transpose to [top_k, num_query_heads, head_dim] for concatenation
-            topk_keys = topk_keys.transpose(0, 1)
-            topk_values = topk_values.transpose(0, 1)
+        if num_candidates > 0:
+            cand_indices = torch.arange(
+                cand_start, cand_end, dtype=torch.int64, device=device)
+            cand_keys, cand_values = _gather_paged_kv(
+                kv_cache, block_table_row, cand_indices, block_size)
+            cand_keys_exp, cand_values_exp = _repeat_kv(
+                cand_keys, cand_values, self.num_queries_per_kv)
+            topk_keys, topk_values = _topk_select_query_head_level(
+                query_row, cand_keys_exp, cand_values_exp, top_k, self.scale)
+            state.topk_keys_per_layer[layer_idx] = topk_keys
+            state.topk_values_per_layer[layer_idx] = topk_values
         else:
-            # No top-k available (shouldn't happen in normal flow)
-            topk_keys = torch.empty(
-                (0, self.num_heads, self.head_size),
-                device=device,
-                dtype=query_row.dtype,
-            )
-            topk_values = torch.empty(
-                (0, self.num_heads, self.head_size),
-                device=device,
-                dtype=query_row.dtype,
-            )
+            state.topk_keys_per_layer[layer_idx] = torch.empty(
+                (self.num_heads, 0, self.head_size),
+                device=device, dtype=query.dtype)
+            state.topk_values_per_layer[layer_idx] = torch.empty(
+                (self.num_heads, 0, self.head_size),
+                device=device, dtype=query.dtype)
 
-        # 4. Concatenate: [sink] + [topk] + [recent] at query head level
-        # Each tensor is [seq_portion, num_query_heads, head_dim]
-        dense_keys = torch.cat([sink_keys, topk_keys, recent_keys], dim=0)
-        dense_values = torch.cat([sink_values, topk_values, recent_values], dim=0)
+    # ---- Batched SAGE decode ----
 
-        window_len = dense_keys.shape[0]
+    def _batched_sage_decode(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: SageAttentionMetadata,
+        output: torch.Tensor,
+        sage_row_cpu: torch.Tensor,
+        N: int,
+        layer_idx: int,
+    ) -> None:
+        """Batched SAGE decode for all long-context rows.
+
+        Replaces the per-row loop with:
+        1. One batched gather for sink tokens across all rows
+        2. One batched gather for recent tokens across all rows
+        3. One stack for stored top-k KV
+        4. One batched GQA expansion
+        5. One flash_attn_varlen_func call for all SAGE rows
+        """
+        device = query.device
+        num_sink = self.sage_num_sink_tokens
+        recent = self.sage_recent_window
+        top_k = self.sage_top_k
+        head_dim = self.head_size
+        block_size = kv_cache.shape[2]
+
+        key_cache = kv_cache[0]    # [num_blocks, block_size, num_kv_heads, D]
+        value_cache = kv_cache[1]
+
+        sage_gpu = sage_row_cpu.to(device, dtype=torch.long, non_blocking=True)
+        block_table_sage = attn_metadata.block_table[sage_gpu]  # [N, max_blk]
+        seq_lens_sage = attn_metadata.seq_lens[sage_gpu]        # [N] GPU
+
+        # ---- 1. Batched sink gather ----
+        # Sink indices are the same for every row → use cached tensor.
+        sink_idx = self._cached_sink_indices          # [num_sink]
+        sink_blk = sink_idx // block_size             # [num_sink]
+        sink_off = sink_idx % block_size              # [num_sink]
+
+        # Physical blocks: block_table_sage[:, sink_blk] → [N, num_sink]
+        sink_phys = block_table_sage[:, sink_blk]
+        flat_sink_phys = sink_phys.reshape(-1)        # [N * num_sink]
+        flat_sink_off = sink_off.unsqueeze(0).expand(N, -1).reshape(-1)
+
+        sink_k = key_cache[flat_sink_phys, flat_sink_off].reshape(
+            N, num_sink, self.num_kv_heads, head_dim)
+        sink_v = value_cache[flat_sink_phys, flat_sink_off].reshape(
+            N, num_sink, self.num_kv_heads, head_dim)
+
+        # ---- 2. Batched recent gather ----
+        offsets = torch.arange(recent, device=device, dtype=torch.long)
+        # recent_pos[i, j] = seq_lens_sage[i] - recent + j
+        recent_pos = (seq_lens_sage.unsqueeze(1).long() - recent
+                      + offsets.unsqueeze(0))          # [N, recent]
+
+        recent_blk_idx = recent_pos // block_size      # [N, recent]
+        recent_slot_off = recent_pos % block_size      # [N, recent]
+
+        recent_phys = torch.gather(
+            block_table_sage.long(), 1, recent_blk_idx)  # [N, recent]
+        flat_recent_phys = recent_phys.reshape(-1)
+        flat_recent_off = recent_slot_off.reshape(-1)
+
+        recent_k = key_cache[flat_recent_phys, flat_recent_off].reshape(
+            N, recent, self.num_kv_heads, head_dim)
+        recent_v = value_cache[flat_recent_phys, flat_recent_off].reshape(
+            N, recent, self.num_kv_heads, head_dim)
+
+        # ---- 3. GQA expansion for sink & recent ----
+        n_rep = self.num_queries_per_kv
+        if n_rep > 1:
+            # [N, S, kv_h, D] → [N, S, kv_h, n_rep, D] → [N, S, q_h, D]
+            sink_k = (sink_k.unsqueeze(3)
+                      .expand(-1, -1, -1, n_rep, -1)
+                      .reshape(N, num_sink, self.num_heads, head_dim))
+            sink_v = (sink_v.unsqueeze(3)
+                      .expand(-1, -1, -1, n_rep, -1)
+                      .reshape(N, num_sink, self.num_heads, head_dim))
+            recent_k = (recent_k.unsqueeze(3)
+                        .expand(-1, -1, -1, n_rep, -1)
+                        .reshape(N, recent, self.num_heads, head_dim))
+            recent_v = (recent_v.unsqueeze(3)
+                        .expand(-1, -1, -1, n_rep, -1)
+                        .reshape(N, recent, self.num_heads, head_dim))
+
+        # ---- 4. Stack stored top-k KV ----
+        # Each state stores [num_q_heads, top_k, head_dim].
+        topk_k_list: list[torch.Tensor] = []
+        topk_v_list: list[torch.Tensor] = []
+        for idx in range(N):
+            row_i = int(sage_row_cpu[idx])
+            state = attn_metadata.request_states[row_i]
+            if state is not None and layer_idx in state.topk_keys_per_layer:
+                # [num_q_heads, top_k, D] → [top_k, num_q_heads, D]
+                topk_k_list.append(
+                    state.topk_keys_per_layer[layer_idx].transpose(0, 1))
+                topk_v_list.append(
+                    state.topk_values_per_layer[layer_idx].transpose(0, 1))
+            else:
+                topk_k_list.append(torch.zeros(
+                    top_k, self.num_heads, head_dim,
+                    device=device, dtype=query.dtype))
+                topk_v_list.append(torch.zeros(
+                    top_k, self.num_heads, head_dim,
+                    device=device, dtype=query.dtype))
+
+        topk_k = torch.stack(topk_k_list, dim=0)  # [N, top_k, q_heads, D]
+        topk_v = torch.stack(topk_v_list, dim=0)
+
+        # ---- 5. Concatenate dense KV ----
+        # Each part: [N, *, num_q_heads, head_dim]
+        dense_k = torch.cat([sink_k, topk_k, recent_k], dim=1)
+        dense_v = torch.cat([sink_v, topk_v, recent_v], dim=1)
+        wl = dense_k.shape[1]  # window_length
 
         if layer_idx == 0:
             logger.info(
-                "[SAGE-DENSE-KV] sink=%d, topk=%d, recent=%d, "
-                "window_len=%d (should equal %d), dense_keys.shape=%s",
-                len(sink_indices),
-                topk_keys.shape[0],
-                len(recent_indices),
-                window_len,
-                self.sage_window_length,
-                tuple(dense_keys.shape),
+                "[SAGE-BATCHED] N=%d, sink=%d, topk=%d, recent=%d, "
+                "window_len=%d, dense_k.shape=%s",
+                N, num_sink, top_k, recent, wl, tuple(dense_k.shape),
             )
 
-        # Run FlashAttention on the dense KV (single-sequence, non-paged).
-        # K/V are at query head level, so this is MHA (not GQA).
-        cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
-        cu_seqlens_k = torch.tensor([0, window_len], dtype=torch.int32, device=device)
+        # Flatten for varlen: [N * wl, num_q_heads, head_dim]
+        dense_k = dense_k.reshape(N * wl, self.num_heads, head_dim)
+        dense_v = dense_v.reshape(N * wl, self.num_heads, head_dim)
 
-        # query_row: [num_heads, head_dim] → [1, num_heads, head_dim]
-        q = query_row.unsqueeze(0)
+        # ---- 6. One batched dense FA call ----
+        q_sage = query[sage_gpu]  # [N, num_q_heads, head_dim]
 
-        # K/V: [window_len, num_query_heads, head_dim] - same head count as Q
-        out_buf = output_row.unsqueeze(0)  # [1, num_heads, head_dim]
+        cu_seqlens_q = torch.arange(
+            0, N + 1, dtype=torch.int32, device=device)
+        cu_seqlens_k = (torch.arange(
+            0, N + 1, dtype=torch.int32, device=device) * wl)
 
+        out_sage = torch.empty_like(q_sage)
         flash_attn_varlen_func(
-            q=q,
-            k=dense_keys,
-            v=dense_values,
-            out=out_buf,
+            q=q_sage,
+            k=dense_k,
+            v=dense_v,
+            out=out_sage,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=1,
             cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_k=window_len,
+            max_seqlen_k=wl,
             softmax_scale=self.scale,
-            causal=False,  # not causal – positions are non-contiguous
+            causal=False,
             alibi_slopes=None,
             window_size=[-1, -1],
             block_table=None,
             softcap=self.logits_soft_cap,
             fa_version=self.vllm_flash_attn_version,
         )
-
-        if layer_idx == 0:
-            logger.info(
-                "[SAGE-DECODE-DONE] Completed SAGE decode: q.shape=%s, "
-                "k.shape=%s, window_len=%d (logged for layer 0 only)",
-                tuple(q.shape),
-                tuple(dense_keys.shape),
-                window_len,
-            )
+        output[sage_gpu] = out_sage

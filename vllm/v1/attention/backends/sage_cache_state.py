@@ -18,10 +18,6 @@ from dataclasses import dataclass, field
 
 import torch
 
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
-
 
 @dataclass
 class SageRequestState:
@@ -58,23 +54,11 @@ class SageRequestStateRegistry:
         if state is None:
             state = SageRequestState()
             self._states[request_id] = state
-            logger.info(
-                "[SAGE-STATE] Created new state for request_id=%s, "
-                "total_active_states=%d",
-                request_id,
-                len(self._states),
-            )
         return state
 
     def prune(self, active_request_ids: set[str]) -> None:
         """Drop states for requests that are no longer active."""
         stale = self._states.keys() - active_request_ids
-        if stale:
-            logger.info(
-                "[SAGE-STATE] Pruning %d stale requests: %s",
-                len(stale),
-                list(stale)[:3],  # Only show first 3 to avoid log spam
-            )
         for rid in stale:
             del self._states[rid]
 

@@ -322,33 +322,6 @@ class SageAttentionMetadataBuilder(AttentionMetadataBuilder[SageAttentionMetadat
             is_first_long_list, dtype=torch.bool, device="cpu"
         )
 
-        # Debug logging
-        num_long = sum(is_long_list)
-        num_first_long = sum(is_first_long_list)
-
-        # Get actual seq_len values for debugging
-        seq_lens_list = []
-        for i in range(min(num_reqs, 5)):  # Show first 5
-            seq_len_i = (
-                int(seq_lens[i].item())
-                if seq_lens.is_cpu
-                else int(seq_lens.cpu()[i].item())
-            )
-            seq_lens_list.append(seq_len_i)
-
-        logger.info(
-            "[SAGE-BUILD] num_reqs=%d, max_query_len=%d, max_seq_len=%d, "
-            "num_long_context=%d, num_first_long_decode=%d, "
-            "sage_window_length=%d, first_seq_lens=%s",
-            num_reqs,
-            max_query_len,
-            max_seq_len,
-            num_long,
-            num_first_long,
-            self.sage_window_length,
-            seq_lens_list,
-        )
-
         return SageAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -633,46 +606,13 @@ class SageAttentionImpl(AttentionImpl):
             and attn_metadata.is_long_context.any().item()
         )
 
-        # Get layer index for conditional logging (only log on layer 0)
-        layer_idx = getattr(layer, "_layer_index", 0)
-
         if not has_long_decode:
             # ---- Standard FlashAttention path (prefill, short decode) ----
-            if layer_idx == 0:
-                # Determine why SAGE path was not taken
-                if attn_metadata.max_query_len > 1:
-                    reason = "prefill"
-                else:
-                    reason = "short_context"
-                if attn_metadata.is_long_context is not None:
-                    any_long = attn_metadata.is_long_context.any().item()
-                else:
-                    any_long = False
-                logger.info(
-                    "[SAGE-FORWARD] Standard FA path (reason=%s): "
-                    "query.shape=%s, max_query_len=%d, max_seq_len=%d, "
-                    "any_long_context=%s, window_length=%d",
-                    reason,
-                    tuple(query.shape),
-                    attn_metadata.max_query_len,
-                    attn_metadata.max_seq_len,
-                    any_long,
-                    self.sage_window_length,
-                )
             return self._flash_attn_forward(
                 layer, query, kv_cache, attn_metadata, output
             )
 
         # ---- Mixed batch: some rows need SAGE, others are standard ----
-        if layer_idx == 0:
-            num_long = attn_metadata.is_long_context.sum().item()
-            logger.info(
-                "[SAGE-FORWARD] SAGE mixed path: query.shape=%s, "
-                "num_reqs=%d, num_long_context=%d",
-                tuple(query.shape),
-                attn_metadata.seq_lens.shape[0],
-                num_long,
-            )
         return self._sage_mixed_forward(layer, query, kv_cache, attn_metadata, output)
 
     # ---- Standard FA path ----
@@ -859,13 +799,6 @@ class SageAttentionImpl(AttentionImpl):
         cand_end = seq_len - recent
         num_candidates = max(0, cand_end - cand_start)
 
-        if layer_idx == 0:
-            logger.info(
-                "[SAGE-TOPK-SELECT] row=%d, cand_range=[%d:%d], "
-                "num_candidates=%d, top_k=%d",
-                row_i, cand_start, cand_end, num_candidates, top_k,
-            )
-
         if num_candidates > 0:
             cand_indices = torch.arange(
                 cand_start, cand_end, dtype=torch.int64, device=device)
@@ -1002,13 +935,6 @@ class SageAttentionImpl(AttentionImpl):
         dense_k = torch.cat([sink_k, topk_k, recent_k], dim=1)
         dense_v = torch.cat([sink_v, topk_v, recent_v], dim=1)
         wl = dense_k.shape[1]  # window_length
-
-        if layer_idx == 0:
-            logger.info(
-                "[SAGE-BATCHED] N=%d, sink=%d, topk=%d, recent=%d, "
-                "window_len=%d, dense_k.shape=%s",
-                N, num_sink, top_k, recent, wl, tuple(dense_k.shape),
-            )
 
         # Flatten for varlen: [N * wl, num_q_heads, head_dim]
         dense_k = dense_k.reshape(N * wl, self.num_heads, head_dim)

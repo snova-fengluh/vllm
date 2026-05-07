@@ -57,6 +57,7 @@ from vllm.config import (
     ReasoningConfig,
     SageConfig,
     SchedulerConfig,
+    SnapKVConfig,
     SpeculativeConfig,
     StructuredOutputsConfig,
     UVAOffloadConfig,
@@ -566,6 +567,14 @@ class EngineArgs:
     sage_num_sink_tokens: int = SageConfig.num_sink_tokens
     sage_top_k: int = SageConfig.top_k
     sage_num_full_kv_layer: int = SageConfig.num_full_kv_layer
+
+    # SnapKV attention fields
+    snapkv_enabled: bool = SnapKVConfig.enabled
+    snapkv_window_length: int = SnapKVConfig.window_length
+    snapkv_query_window_size: int = SnapKVConfig.query_window_size
+    snapkv_kernel_size: int = SnapKVConfig.kernel_size
+    snapkv_pooling: str = SnapKVConfig.pooling
+    snapkv_num_full_kv_layer: int = SnapKVConfig.num_full_kv_layer
 
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
@@ -1250,6 +1259,27 @@ class EngineArgs:
             "--sage-num-full-kv-layer", **sage_kwargs["num_full_kv_layer"]
         )
 
+        # SnapKV attention arguments
+        snapkv_kwargs = get_kwargs(SnapKVConfig)
+        snapkv_group = parser.add_argument_group(
+            title="SnapKVConfig",
+            description=SnapKVConfig.__doc__,
+        )
+        snapkv_group.add_argument("--snapkv-enabled", **snapkv_kwargs["enabled"])
+        snapkv_group.add_argument(
+            "--snapkv-window-length", **snapkv_kwargs["window_length"]
+        )
+        snapkv_group.add_argument(
+            "--snapkv-query-window-size", **snapkv_kwargs["query_window_size"]
+        )
+        snapkv_group.add_argument(
+            "--snapkv-kernel-size", **snapkv_kwargs["kernel_size"]
+        )
+        snapkv_group.add_argument("--snapkv-pooling", **snapkv_kwargs["pooling"])
+        snapkv_group.add_argument(
+            "--snapkv-num-full-kv-layer", **snapkv_kwargs["num_full_kv_layer"]
+        )
+
         # Observability arguments
         observability_kwargs = get_kwargs(ObservabilityConfig)
         observability_group = parser.add_argument_group(
@@ -1496,6 +1526,13 @@ class EngineArgs:
                 self.seed,
             )
 
+        # SAGE and SnapKV are mutually exclusive (they replace the same model
+        # architecture and would clobber each other's wiring).
+        if self.sage_enabled and self.snapkv_enabled:
+            raise ValueError(
+                "--sage-enabled and --snapkv-enabled are mutually exclusive."
+            )
+
         # When SAGE is enabled, automatically switch to the SAGE model variant
         hf_overrides = self.hf_overrides
         if self.sage_enabled:
@@ -1544,6 +1581,54 @@ class EngineArgs:
                 return hf_config
 
             hf_overrides = sage_hf_overrides
+
+        # When SnapKV is enabled, automatically switch to the SnapKV model
+        # variant.
+        if self.snapkv_enabled:
+            logger.info(
+                "SNAPKV ATTENTION ENABLED  "
+                "window=%d  obs_window=%d  kernel=%d  pooling=%s  "
+                "full_kv_layers=%d  arch=MiniMaxM2SnapKVForCausalLM",
+                self.snapkv_window_length,
+                self.snapkv_query_window_size,
+                self.snapkv_kernel_size,
+                self.snapkv_pooling,
+                self.snapkv_num_full_kv_layer,
+            )
+
+            original_overrides = hf_overrides
+
+            def snapkv_hf_overrides(hf_config):
+                if callable(original_overrides):
+                    original_overrides(hf_config)
+                elif original_overrides and isinstance(original_overrides, dict):
+                    for key, value in original_overrides.items():
+                        setattr(hf_config, key, value)
+
+                if hasattr(hf_config, "architectures"):
+                    archs = hf_config.architectures
+                    if archs and "MiniMaxM2ForCausalLM" in archs:
+                        hf_config.architectures = ["MiniMaxM2SnapKVForCausalLM"]
+                        logger.info(
+                            "SNAPKV: Switched architecture from "
+                            "MiniMaxM2ForCausalLM to MiniMaxM2SnapKVForCausalLM"
+                        )
+                    elif archs:
+                        logger.info("SNAPKV: Original architecture: %s", archs)
+                        hf_config.architectures = ["MiniMaxM2SnapKVForCausalLM"]
+                        logger.info(
+                            "SNAPKV: Set architecture to "
+                            "MiniMaxM2SnapKVForCausalLM"
+                        )
+                else:
+                    hf_config.architectures = ["MiniMaxM2SnapKVForCausalLM"]
+                    logger.info(
+                        "SNAPKV: Set architecture to MiniMaxM2SnapKVForCausalLM"
+                    )
+
+                return hf_config
+
+            hf_overrides = snapkv_hf_overrides
 
         return ModelConfig(
             model=self.model,
@@ -2055,6 +2140,20 @@ class EngineArgs:
             else None
         )
 
+        # Create SnapKV config if enabled
+        snapkv_config = (
+            SnapKVConfig(
+                enabled=True,
+                window_length=self.snapkv_window_length,
+                query_window_size=self.snapkv_query_window_size,
+                kernel_size=self.snapkv_kernel_size,
+                pooling=self.snapkv_pooling,
+                num_full_kv_layer=self.snapkv_num_full_kv_layer,
+            )
+            if self.snapkv_enabled
+            else None
+        )
+
         if (
             lora_config is not None
             and speculative_config is not None
@@ -2090,6 +2189,11 @@ class EngineArgs:
         if self.sage_enabled and attention_config.backend is None:
             attention_config.backend = AttentionBackendEnum.SAGE_ATTN
             logger.info("SAGE: Selected attention backend SAGE_ATTN")
+
+        # When SnapKV is enabled, force the SnapKV attention backend.
+        if self.snapkv_enabled and attention_config.backend is None:
+            attention_config.backend = AttentionBackendEnum.SNAPKV_ATTN
+            logger.info("SNAPKV: Selected attention backend SNAPKV_ATTN")
 
         # TurboQuant requires FlashAttention 2 — FA3 boundary layers assert
         # FlashAttentionImpl which fails with TurboQuantAttentionImpl.
@@ -2222,6 +2326,7 @@ class EngineArgs:
             kernel_config=kernel_config,
             lora_config=lora_config,
             sage_config=sage_config,
+            snapkv_config=snapkv_config,
             speculative_config=speculative_config,
             structured_outputs_config=self.structured_outputs_config,
             observability_config=observability_config,

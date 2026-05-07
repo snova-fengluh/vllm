@@ -482,6 +482,67 @@ class SinkFullAttentionSpec(FullAttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class SnapKVAttentionSpec(FullAttentionSpec):
+    """
+    KV cache spec for SnapKV (attention-guided KV cache compression).
+
+    SnapKV compresses the KV cache after prefilling. The last
+    ``query_window_size`` queries from the prefill are used as observers
+    to vote (via 1-D pooled softmaxed attention) for which past tokens
+    are most important. The selected ``window_length - query_window_size``
+    top-k tokens together with the observation window form the compressed
+    cache of size ``window_length``.
+    """
+
+    window_length: int = 8192  # Total compressed cache budget
+    query_window_size: int = 30  # Observation window size
+    kernel_size: int = 13  # 1-D pooling kernel size
+    pooling: str = "avgpool"  # 'avgpool' or 'maxpool'
+    num_full_kv_layer: int = 0  # Layers using full cache (no SnapKV)
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        """For SnapKV, the prefill-time cache is bounded by ``window_length``.
+
+        Decode-time tokens are appended on top, but for memory planning
+        purposes we use ``window_length`` (matching SAGE's accounting).
+        """
+        return cdiv(self.window_length, self.block_size) * self.page_size_bytes
+
+    @property
+    def topk_length(self) -> int:
+        """Number of top-k past tokens kept after compression."""
+        return self.window_length - self.query_window_size
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        """Merge a list of SnapKVAttentionSpec objects."""
+        assert all(isinstance(spec, SnapKVAttentionSpec) for spec in specs), (
+            "All attention layers must be SnapKVAttentionSpec."
+        )
+
+        for spec in specs[1:]:
+            assert spec.window_length == specs[0].window_length
+            assert spec.query_window_size == specs[0].query_window_size
+            assert spec.kernel_size == specs[0].kernel_size
+            assert spec.pooling == specs[0].pooling
+
+        return cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            head_size_v=specs[0].head_size_v,
+            dtype=specs[0].dtype,
+            kv_quant_mode=specs[0].kv_quant_mode,
+            page_size_padded=specs[0].page_size_padded,
+            window_length=specs[0].window_length,
+            query_window_size=specs[0].query_window_size,
+            kernel_size=specs[0].kernel_size,
+            pooling=specs[0].pooling,
+            num_full_kv_layer=specs[0].num_full_kv_layer,
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
 class SageAttentionSpec(FullAttentionSpec):
     """
     KV cache spec for SAGE (Self-Attention Guided Eviction) attention.
@@ -605,6 +666,15 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
                 and spec.window_length == one_spec.window_length
                 and spec.num_sink_tokens == one_spec.num_sink_tokens
                 and spec.top_k == one_spec.top_k
+                for spec in kv_cache_specs.values()
+            )
+        elif isinstance(one_spec, SnapKVAttentionSpec):
+            return all(
+                isinstance(spec, SnapKVAttentionSpec)
+                and spec.window_length == one_spec.window_length
+                and spec.query_window_size == one_spec.query_window_size
+                and spec.kernel_size == one_spec.kernel_size
+                and spec.pooling == one_spec.pooling
                 for spec in kv_cache_specs.values()
             )
         else:

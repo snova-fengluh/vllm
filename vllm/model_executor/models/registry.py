@@ -163,6 +163,10 @@ _TEXT_GENERATION_MODELS = {
     "MiniMaxM1ForCausalLM": ("minimax_text_01", "MiniMaxText01ForCausalLM"),
     "MiniMaxM2ForCausalLM": ("minimax_m2", "MiniMaxM2ForCausalLM"),
     "MiniMaxM2SageForCausalLM": ("minimax_m2_sage", "MiniMaxM2SageForCausalLM"),
+    "MiniMaxM2SnapKVForCausalLM": (
+        "minimax_m2_snapkv",
+        "MiniMaxM2SnapKVForCausalLM",
+    ),
     "Ministral3ForCausalLM": ("mistral", "MistralForCausalLM"),
     "MistralForCausalLM": ("mistral", "MistralForCausalLM"),
     "MistralLarge3ForCausalLM": ("mistral_large_3", "MistralLarge3ForCausalLM"),

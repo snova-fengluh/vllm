@@ -46,6 +46,7 @@ from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
 from .sage import SageConfig
 from .scheduler import SchedulerConfig
+from .snapkv import SnapKVConfig
 from .speculative import EagleModelTypes, NgramGPUTypes, SpeculativeConfig
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config, replace
@@ -296,6 +297,8 @@ class VllmConfig:
     """LoRA configuration."""
     sage_config: SageConfig | None = None
     """SAGE (Self-Attention Guided Eviction) configuration for bounded KV cache."""
+    snapkv_config: SnapKVConfig | None = None
+    """SnapKV configuration for attention-guided KV cache compression."""
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
     structured_outputs_config: StructuredOutputsConfig = Field(
@@ -421,6 +424,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.sage_config:
             vllm_factors.append(self.sage_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.snapkv_config:
+            vllm_factors.append(self.snapkv_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.speculative_config:

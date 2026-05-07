@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     SageAttentionSpec,
     SinkFullAttentionSpec,
     SlidingWindowSpec,
+    SnapKVAttentionSpec,
     TQFullAttentionSpec,
 )
 from vllm.v1.request import Request
@@ -1119,6 +1120,7 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     TQFullAttentionSpec: FullAttentionManager,
     MLAAttentionSpec: FullAttentionManager,
     SageAttentionSpec: FullAttentionManager,
+    SnapKVAttentionSpec: FullAttentionManager,
     SlidingWindowSpec: SlidingWindowManager,
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
     MambaSpec: MambaManager,

@@ -202,10 +202,12 @@ class SnapKVAttentionMetadata:
     # Bool tensor [num_reqs] (CPU): True if request's state is compressed
     # (i.e. it has finished prefill compression and is in decode phase).
     is_compressed: torch.Tensor | None = None
-    # Bool tensor [num_reqs] (CPU): True if this row is performing a
-    # prefill that finishes with seq_len >= window_length, requiring
-    # SnapKV compression at the end of forward().
-    needs_prefill_compress: torch.Tensor | None = None
+    # Bool tensor [num_reqs] (CPU): True if this row is a prefill step
+    # where observation queries should be saved for later compression.
+    needs_save_obs_queries: torch.Tensor | None = None
+    # Bool tensor [num_reqs] (CPU): True if this row is the first decode
+    # step after prefill completed, triggering KV cache compression.
+    needs_first_decode_compress: torch.Tensor | None = None
     # CPU int list/tensor of per-row seq_lens (Python ints) for fast access.
     seq_lens_cpu: torch.Tensor | None = None
     # CPU int list/tensor of per-row q_lens.
@@ -333,7 +335,8 @@ class SnapKVAttentionMetadataBuilder(
         # Build per-row state lists.
         req_states: list[SnapKVRequestState | None] = []
         is_compressed_list: list[bool] = []
-        needs_compress_list: list[bool] = []
+        needs_save_obs_list: list[bool] = []
+        needs_first_decode_list: list[bool] = []
         seq_lens_list: list[int] = []
         q_lens_list: list[int] = []
 
@@ -364,23 +367,42 @@ class SnapKVAttentionMetadataBuilder(
                 and len(state.compressed_keys_per_layer) >= self.num_snap_layers
             ):
                 state.compressed = True
+                logger.info(
+                    "SnapKV STATE FLIP request=%r: compressed=True "
+                    "(%d/%d layers populated, prefill_length=%d)",
+                    rid, len(state.compressed_keys_per_layer),
+                    self.num_snap_layers, state.prefill_length,
+                )
 
-            # A row needs prefill-compression at the end of forward when:
-            #   - this is a (chunked) prefill step that ends the prefill
-            #     (q_len_i == seq_len_i for unchunked; for chunked, the
-            #     last chunk has q_len_i + processed == seq_len_i).
-            #   - the resulting prefill length >= window_length.
-            #   - the request has not already been compressed.
             is_prefill_step = q_len_i > 1
-            ends_prefill = q_len_i == seq_len_i  # unchunked prefill
-            needs_compress = (
+            is_decode_step = q_len_i == 1
+
+            # Track prefill progress for chunked-prefill support.
+            if is_prefill_step and state is not None:
+                state.in_prefill = True
+                state.prefill_seq_len = seq_len_i
+
+            # During prefill: save observation queries (last W) per layer so
+            # compression can run at the first decode step.
+            needs_save_obs = (
                 is_prefill_step
-                and ends_prefill
-                and seq_len_i >= self.window_length
                 and state is not None
                 and not state.compressed
             )
-            needs_compress_list.append(needs_compress)
+            needs_save_obs_list.append(needs_save_obs)
+
+            # First decode step after prefill: trigger compression using
+            # saved observation queries + K/V gathered from paged cache.
+            needs_first_decode = (
+                is_decode_step
+                and state is not None
+                and state.in_prefill
+                and not state.compressed
+                and state.prefill_seq_len >= self.window_length
+            )
+            if needs_first_decode and state is not None:
+                state.in_prefill = False  # consumed
+            needs_first_decode_list.append(needs_first_decode)
 
             is_compressed = state is not None and state.compressed
             is_compressed_list.append(is_compressed)
@@ -395,8 +417,11 @@ class SnapKVAttentionMetadataBuilder(
         is_compressed = torch.tensor(
             is_compressed_list, dtype=torch.bool, device="cpu"
         )
-        needs_prefill_compress = torch.tensor(
-            needs_compress_list, dtype=torch.bool, device="cpu"
+        needs_save_obs_queries = torch.tensor(
+            needs_save_obs_list, dtype=torch.bool, device="cpu"
+        )
+        needs_first_decode_compress = torch.tensor(
+            needs_first_decode_list, dtype=torch.bool, device="cpu"
         )
         seq_lens_cpu = torch.tensor(
             seq_lens_list, dtype=torch.int64, device="cpu"
@@ -417,7 +442,8 @@ class SnapKVAttentionMetadataBuilder(
             request_ids=request_ids,
             request_states=req_states,
             is_compressed=is_compressed,
-            needs_prefill_compress=needs_prefill_compress,
+            needs_save_obs_queries=needs_save_obs_queries,
+            needs_first_decode_compress=needs_first_decode_compress,
             seq_lens_cpu=seq_lens_cpu,
             q_lens_cpu=q_lens_cpu,
             query_start_loc_cpu=query_start_loc_cpu.clone(),
@@ -498,6 +524,26 @@ def _gather_paged_kv(
     block_ids = block_table_row[token_indices // block_size]
     slot_offsets = token_indices % block_size
     return key_cache[block_ids, slot_offsets], value_cache[block_ids, slot_offsets]
+
+
+def _gather_paged_keys(
+    kv_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    token_indices: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Gather only keys (not values) from the paged cache.
+
+    Same as _gather_paged_kv but avoids materializing the value tensor,
+    halving peak memory during the scoring phase of compression.
+
+    Returns:
+        keys [len(token_indices), num_kv_heads, head_size]
+    """
+    key_cache = kv_cache[0]
+    block_ids = block_table_row[token_indices // block_size]
+    slot_offsets = token_indices % block_size
+    return key_cache[block_ids, slot_offsets]
 
 
 def _snapkv_compute_topk(
@@ -596,6 +642,87 @@ def _snapkv_compute_topk(
     compressed_k = torch.cat([topk_k, last_w_k], dim=1)    # [H, k+W, D]
     compressed_v = torch.cat([topk_v, last_w_v], dim=1)
     return compressed_k.contiguous(), compressed_v.contiguous()
+
+
+def _snapkv_compute_topk_indices(
+    obs_q: torch.Tensor,    # [W, num_q_heads, head_dim] (observation queries)
+    k: torch.Tensor,        # [seq_len, num_q_heads, head_dim] (GQA-expanded)
+    seq_len: int,
+    query_window_size: int,
+    topk_length: int,
+    kernel_size: int,
+    pooling: str,
+    scale: float,
+) -> torch.Tensor | None:
+    """Compute only the top-k past-position indices (no V needed).
+
+    This is the scoring-only half of _snapkv_compute_topk, designed for
+    memory-efficient first-decode compression where we want to avoid
+    materializing V during index selection.
+
+    Args:
+        obs_q:  Observation queries [W, num_q_heads, head_dim].
+        k:      Full keys [seq_len, num_q_heads, head_dim] (GQA-expanded).
+        seq_len: Total prefill sequence length.
+        query_window_size: W — number of observation queries.
+        topk_length: Number of past positions to select.
+        kernel_size: 1-D pooling kernel size (odd).
+        pooling: "avgpool" or "maxpool".
+        scale:  Attention scale factor.
+
+    Returns:
+        indices [num_q_heads, actual_k] of selected past positions, or
+        None if there are no past tokens to select from.
+    """
+    W = query_window_size
+
+    if seq_len - W <= 0 or topk_length <= 0:
+        return None
+
+    # Permute to head-major: [H, *, D]
+    q_obs = obs_q.permute(1, 0, 2).contiguous()          # [H, W, D]
+    kh = k.permute(1, 0, 2).contiguous()                 # [H, S, D]
+
+    # Attention scores: [H, W, S]
+    scores = torch.matmul(q_obs, kh.transpose(1, 2)) * scale
+
+    # Causal mask on the W×W observation block.
+    neg_inf = torch.finfo(scores.dtype).min
+    causal_mask = torch.full(
+        (W, W), neg_inf, device=scores.device, dtype=scores.dtype,
+    )
+    idx = torch.arange(W, device=scores.device)
+    causal_mask.masked_fill_(idx.unsqueeze(0) <= idx.unsqueeze(1), 0)
+    scores[:, :, -W:] = scores[:, :, -W:] + causal_mask
+
+    weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(obs_q.dtype)
+    del scores  # free [H, W, S] immediately
+
+    # Sum over observers for past positions [0, S-W).
+    weights_sum = weights[:, :, : seq_len - W].sum(dim=1)  # [H, S-W]
+    del weights
+
+    # 1-D pooling.
+    pad = kernel_size // 2
+    if pooling == "avgpool":
+        pooled = F.avg_pool1d(
+            weights_sum, kernel_size=kernel_size, padding=pad, stride=1,
+        )
+    elif pooling == "maxpool":
+        pooled = F.max_pool1d(
+            weights_sum, kernel_size=kernel_size, padding=pad, stride=1,
+        )
+    else:
+        raise ValueError(f"Unknown SnapKV pooling: {pooling!r}")
+    del weights_sum
+
+    actual_k = min(topk_length, seq_len - W)
+    if actual_k <= 0:
+        return None
+
+    _, indices = torch.topk(pooled, k=actual_k, dim=-1, largest=True, sorted=False)
+    # indices: [H, actual_k]
+    return indices
 
 
 # ---------------------------------------------------------------------------
@@ -735,8 +862,45 @@ class SnapKVAttentionImpl(AttentionImpl):
         layer_idx = _resolve_layer_index(layer)
 
         # ------------------------------------------------------------------
-        # Decode phase: handle requests with already-compressed KV via the
-        # dense reconstruction path; standard paged FA handles the rest.
+        # Phase 1: During prefill chunks, save the last W observation queries
+        # per request per layer for later compression.
+        # ------------------------------------------------------------------
+        if (
+            attn_metadata.needs_save_obs_queries is not None
+            and bool(attn_metadata.needs_save_obs_queries.any().item())
+        ):
+            self._save_observation_queries(query, attn_metadata, layer_idx)
+
+        # ------------------------------------------------------------------
+        # Phase 2: At the first decode step after prefill completes, gather
+        # full K/V from the paged cache and run SnapKV top-k compression.
+        # ------------------------------------------------------------------
+        if (
+            attn_metadata.needs_first_decode_compress is not None
+            and bool(attn_metadata.needs_first_decode_compress.any().item())
+        ):
+            n_compress = int(
+                attn_metadata.needs_first_decode_compress.sum().item()
+            )
+            logger.info(
+                "SnapKV FIRST-DECODE COMPRESS layer=%d: %d request(s) "
+                "triggering top-k compression from paged cache",
+                layer_idx, n_compress,
+            )
+            self._do_first_decode_compression(
+                kv_cache, attn_metadata, layer_idx
+            )
+            # Mark newly-compressed requests so Phase 3 routes them through
+            # the compressed decode path on this same step (consistent with
+            # the sambaLLMs reference where the first decode token already
+            # uses compressed KV).
+            attn_metadata.is_compressed = (
+                attn_metadata.is_compressed
+                | attn_metadata.needs_first_decode_compress
+            )
+
+        # ------------------------------------------------------------------
+        # Phase 3: Run attention.
         # ------------------------------------------------------------------
         has_compressed_decode = (
             attn_metadata.is_compressed is not None
@@ -745,25 +909,18 @@ class SnapKVAttentionImpl(AttentionImpl):
         )
 
         if has_compressed_decode:
+            n_comp = int(attn_metadata.is_compressed.sum().item())
+            n_total = int(attn_metadata.is_compressed.shape[0])
+            logger.info(
+                "SnapKV DECODE layer=%d: %d/%d requests using compressed KV",
+                layer_idx, n_comp, n_total,
+            )
             self._decode_mixed_forward(
                 layer, query, kv_cache, attn_metadata, output, layer_idx
             )
         else:
             self._flash_attn_forward(
                 layer, query, kv_cache, attn_metadata, output
-            )
-
-        # ------------------------------------------------------------------
-        # Prefill compression: at the end of any prefill step, compute and
-        # store top-k KV for requests that just finished prefill with
-        # seq_len >= window_length.
-        # ------------------------------------------------------------------
-        if (
-            attn_metadata.needs_prefill_compress is not None
-            and bool(attn_metadata.needs_prefill_compress.any().item())
-        ):
-            self._do_prefill_compression(
-                query, key, value, attn_metadata, layer_idx
             )
 
         return output
@@ -944,14 +1101,19 @@ class SnapKVAttentionImpl(AttentionImpl):
         for idx in range(N):
             row_i = int(comp_row_cpu[idx])
             state = attn_metadata.request_states[row_i]
-            assert state is not None and state.compressed
+            assert state is not None
             assert layer_idx in state.compressed_keys_per_layer, (
                 f"SnapKV decode: layer {layer_idx} missing compressed K "
                 f"for request idx {row_i}"
             )
 
-            comp_k = state.compressed_keys_per_layer[layer_idx]   # [H_q, W, D]
-            comp_v = state.compressed_values_per_layer[layer_idx]
+            # Transfer compressed K/V from CPU to GPU just-in-time.
+            comp_k = state.compressed_keys_per_layer[layer_idx].to(
+                device, non_blocking=True,
+            )   # [H_q, W, D]
+            comp_v = state.compressed_values_per_layer[layer_idx].to(
+                device, non_blocking=True,
+            )
             window_len = comp_k.shape[1]
 
             seq_len_i = int(attn_metadata.seq_lens_cpu[row_i].item())
@@ -1034,41 +1196,31 @@ class SnapKVAttentionImpl(AttentionImpl):
         )
         output[comp_gpu] = out_comp
 
-    # ---- Prefill compression ----
+    # ---- Observation-query saving (during prefill chunks) ----
 
-    def _do_prefill_compression(
+    def _save_observation_queries(
         self,
         query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
         attn_metadata: SnapKVAttentionMetadata,
         layer_idx: int,
     ) -> None:
-        """For each row that just finished prefill, compute & store top-k KV.
+        """Save the last W observation queries from each prefill chunk.
 
-        Inputs are the in-batch projections (already RoPE'd by the model
-        layer):
-            query: [num_actual_tokens, num_q_heads,  head_dim]
-            key:   [num_actual_tokens, num_kv_heads, head_dim]
-            value: [num_actual_tokens, num_kv_heads, head_dim]
-
-        For each request whose state's ``compressed`` flag is False and
-        whose ``needs_prefill_compress`` is True, slice out its tokens
-        from the batch and run :func:`_snapkv_compute_topk` to derive
-        the per-query-head compressed K/V tensors.
-
-        ``state.compressed`` is *not* flipped here; the caller (model
-        wrapper) calls :func:`finalize_prefill_compression` after the
-        last layer so all per-layer entries are populated atomically.
+        During chunked prefill the full prefill Q is never available in a
+        single batch.  Instead, each chunk saves its last W queries (or
+        fewer if the chunk is shorter than W).  Across chunks the saved
+        tensor is accumulated so that when prefill ends the most recent W
+        queries of the entire prefill are available for compression.
         """
-        # Skip layers that should keep full KV (no compression).
         if layer_idx < self.num_full_kv_layer:
             return
 
-        needs = attn_metadata.needs_prefill_compress       # CPU bool
+        needs = attn_metadata.needs_save_obs_queries
         rows = needs.nonzero(as_tuple=True)[0].tolist()
         if not rows:
             return
+
+        W = self.query_window_size
 
         for row_i in rows:
             row_i = int(row_i)
@@ -1076,43 +1228,204 @@ class SnapKVAttentionImpl(AttentionImpl):
             if state is None or state.compressed:
                 continue
 
-            seq_len_i = int(attn_metadata.seq_lens_cpu[row_i].item())
-            q_len_i = int(attn_metadata.q_lens_cpu[row_i].item())
-            # Unchunked prefill: the request's tokens occupy a contiguous
-            # block in the batch starting at query_start_loc[row_i].
             start = int(attn_metadata.query_start_loc_cpu[row_i].item())
+            q_len_i = int(attn_metadata.q_lens_cpu[row_i].item())
             end = start + q_len_i
-            assert q_len_i == seq_len_i, (
-                "SnapKV prefill compression assumes unchunked prefill "
-                f"(q_len={q_len_i}, seq_len={seq_len_i})."
+
+            q_chunk = query[start:end]        # [q_len_i, H_q, D]
+            obs_new = q_chunk[-min(W, q_len_i):]  # last W (or fewer)
+
+            # Accumulate across chunks to always keep the last W queries.
+            prev = state.observation_queries_per_layer.get(layer_idx)
+            if prev is not None and obs_new.shape[0] < W:
+                combined = torch.cat([prev, obs_new], dim=0)
+                obs_new = combined[-W:]
+
+            state.observation_queries_per_layer[layer_idx] = obs_new.clone()
+
+    # ---- First-decode compression (from paged cache) ----
+
+    def _do_first_decode_compression(
+        self,
+        kv_cache: torch.Tensor,
+        attn_metadata: SnapKVAttentionMetadata,
+        layer_idx: int,
+    ) -> None:
+        """At the first decode step, gather K/V from paged cache and compress.
+
+        Memory-efficient implementation:
+          1. Gather only K (not V) from paged cache for scoring.
+          2. Compute top-k indices using _snapkv_compute_topk_indices.
+          3. Gather only the selected top-k + observation window positions'
+             K/V from paged cache (much smaller than the full gather).
+          4. Store compressed K/V on CPU to avoid GPU memory accumulation
+             across all layers (~9 GB for 62 layers x 3 requests on GPU).
+        """
+        if layer_idx < self.num_full_kv_layer:
+            return
+
+        needs = attn_metadata.needs_first_decode_compress
+        rows = needs.nonzero(as_tuple=True)[0].tolist()
+        if not rows:
+            return
+
+        device = kv_cache.device
+        block_size = kv_cache.shape[2]
+        num_kv_heads = kv_cache.shape[3]
+        head_dim = kv_cache.shape[4]
+        num_q_heads = self.num_heads
+
+        for row_i in rows:
+            row_i = int(row_i)
+            state = attn_metadata.request_states[row_i]
+            if state is None or state.compressed:
+                continue
+
+            obs_q = state.observation_queries_per_layer.get(layer_idx)
+            if obs_q is None:
+                logger.warning(
+                    "SnapKV: no observation queries for layer %d, "
+                    "request row %d — skipping compression",
+                    layer_idx, row_i,
+                )
+                continue
+
+            prefill_len = state.prefill_seq_len
+            actual_w = obs_q.shape[0]
+            topk_length = self.window_length - actual_w
+            block_table_row = attn_metadata.block_table[row_i]
+
+            # ----------------------------------------------------------
+            # Step 1: Gather only K for scoring (half the memory of K+V).
+            # ----------------------------------------------------------
+            all_indices = torch.arange(
+                prefill_len, dtype=torch.int64, device=device,
             )
-
-            q_req = query[start:end]                  # [S, H_q, D]
-            k_req = key[start:end]                    # [S, H_kv, D]
-            v_req = value[start:end]                  # [S, H_kv, D]
-
-            # GQA expand K/V to query-head level so per-head top-k is valid.
-            k_q_heads, v_q_heads = _repeat_kv(
-                k_req, v_req, self.num_queries_per_kv
+            k_all = _gather_paged_keys(
+                kv_cache, block_table_row, all_indices, block_size,
             )
+            # k_all: [prefill_len, num_kv_heads, head_dim]
+            del all_indices
 
-            comp_k, comp_v = _snapkv_compute_topk(
-                q_req,
-                k_q_heads,
-                v_q_heads,
-                query_window_size=self.query_window_size,
-                topk_length=self.topk_length,
+            # GQA expand K only.
+            if self.num_queries_per_kv > 1:
+                k_expanded = k_all.unsqueeze(2).expand(
+                    prefill_len, num_kv_heads, self.num_queries_per_kv,
+                    head_dim,
+                ).reshape(prefill_len, num_q_heads, head_dim).contiguous()
+                del k_all
+            else:
+                k_expanded = k_all
+
+            # ----------------------------------------------------------
+            # Step 2: Compute top-k indices (no V materialized).
+            # ----------------------------------------------------------
+            # obs_q is [actual_w, num_q_heads, head_dim] on GPU.
+            indices = _snapkv_compute_topk_indices(
+                obs_q, k_expanded, prefill_len,
+                query_window_size=actual_w,
+                topk_length=topk_length,
                 kernel_size=self.kernel_size,
                 pooling=self.pooling,
                 scale=self.scale,
             )
-            # comp_k / comp_v: [num_q_heads, window_length, head_dim]
-            state.compressed_keys_per_layer[layer_idx] = comp_k
-            state.compressed_values_per_layer[layer_idx] = comp_v
-            # Record the prefill length so decode knows where to start
-            # gathering tail tokens from the paged cache. All layers see
-            # the same value, so repeated assignment is fine.
-            state.prefill_length = seq_len_i
+            del k_expanded  # free the large expanded K tensor
+
+            # ----------------------------------------------------------
+            # Step 3: Gather selected positions from paged cache.
+            # Each query head independently selected its own top-k
+            # past positions. We build per-head position lists,
+            # flatten into a single paged cache gather, then extract
+            # each query head's corresponding KV head.
+            # ----------------------------------------------------------
+            obs_window_start = prefill_len - actual_w
+            obs_positions = torch.arange(
+                obs_window_start, prefill_len,
+                dtype=torch.int64, device=device,
+            )
+            # Which KV head each query head maps to under GQA.
+            kv_head_idx = torch.arange(
+                num_q_heads, device=device,
+            ) // self.num_queries_per_kv  # [H_q]
+
+            if indices is not None:
+                # indices: [num_q_heads, actual_k] — positions in [0, S-W)
+                actual_k = indices.shape[1]
+                total_per_head = actual_k + actual_w
+
+                # Per-head position list: [past_selected | obs_window].
+                # all_positions: [H_q, actual_k + actual_w]
+                all_positions = torch.cat([
+                    indices.long(),
+                    obs_positions.unsqueeze(0).expand(num_q_heads, -1),
+                ], dim=1)
+
+                # Single gather from paged cache.
+                flat_positions = all_positions.reshape(-1)
+                k_flat, v_flat = _gather_paged_kv(
+                    kv_cache, block_table_row, flat_positions, block_size,
+                )
+                # k_flat, v_flat: [H_q * total_per_head, num_kv_heads, D]
+                del flat_positions, all_positions
+
+                # Reshape to per-head: [H_q, total_per_head, num_kv_heads, D]
+                k_per_head = k_flat.reshape(
+                    num_q_heads, total_per_head, num_kv_heads, head_dim,
+                )
+                v_per_head = v_flat.reshape(
+                    num_q_heads, total_per_head, num_kv_heads, head_dim,
+                )
+                del k_flat, v_flat
+
+                # Extract each query head's mapped KV head via gather.
+                kv_sel = kv_head_idx.reshape(
+                    num_q_heads, 1, 1, 1,
+                ).expand(-1, total_per_head, 1, head_dim)
+                comp_k = torch.gather(
+                    k_per_head, dim=2, index=kv_sel,
+                ).squeeze(2)  # [H_q, total_per_head, D]
+                comp_v = torch.gather(
+                    v_per_head, dim=2, index=kv_sel,
+                ).squeeze(2)
+                del k_per_head, v_per_head, kv_sel
+            else:
+                # No past tokens to select; use only observation window.
+                actual_k = 0
+                k_obs, v_obs = _gather_paged_kv(
+                    kv_cache, block_table_row, obs_positions, block_size,
+                )
+                # k_obs, v_obs: [actual_w, num_kv_heads, head_dim]
+                # Extract each query head's KV head: [actual_w, H_q, D]
+                comp_k = k_obs[:, kv_head_idx, :].permute(
+                    1, 0, 2,
+                ).contiguous()  # [H_q, actual_w, D]
+                comp_v = v_obs[:, kv_head_idx, :].permute(
+                    1, 0, 2,
+                ).contiguous()
+                del k_obs, v_obs
+
+            del obs_positions
+
+            # ----------------------------------------------------------
+            # Step 4: Store on CPU to avoid GPU memory accumulation.
+            # ----------------------------------------------------------
+            state.compressed_keys_per_layer[layer_idx] = comp_k.cpu()
+            state.compressed_values_per_layer[layer_idx] = comp_v.cpu()
+            state.prefill_length = prefill_len
+            del comp_k, comp_v
+
+            logger.info(
+                "SnapKV COMPRESSED row=%d layer=%d: "
+                "prefill_seq_len=%d -> compressed shape=[%d, %d, %d] "
+                "(topk=%d + obs_window=%d), prefill_length=%d, "
+                "stored on CPU",
+                row_i, layer_idx, prefill_len,
+                num_q_heads, actual_k + actual_w, head_dim,
+                actual_k, actual_w, state.prefill_length,
+            )
+
+            # Free observation queries for this layer (no longer needed).
+            state.observation_queries_per_layer.pop(layer_idx, None)
 
         # The state's ``compressed`` flag is flipped by the metadata
         # builder on the *next* step, once all SnapKV layers have stored

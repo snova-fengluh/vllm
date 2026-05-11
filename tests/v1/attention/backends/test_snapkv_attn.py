@@ -141,6 +141,9 @@ class TestSnapKVRequestState:
         assert state.compressed_values_per_layer == {}
         assert state.prefill_length == 0
         assert state.compressed is False
+        assert state.in_prefill is False
+        assert state.prefill_seq_len == 0
+        assert state.observation_queries_per_layer == {}
 
     def test_request_state_isolation(self):
         registry = SnapKVRequestStateRegistry()

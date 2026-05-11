@@ -43,6 +43,22 @@ class SnapKVRequestState:
     # True once compression has been performed for this request.
     compressed: bool = False
 
+    # --- Chunked-prefill support ---
+
+    # True while the request is still going through prefill chunks.
+    in_prefill: bool = False
+
+    # Total KV length accumulated so far during prefill (updated each chunk).
+    prefill_seq_len: int = 0
+
+    # Per-layer saved observation queries (the last W queries from the most
+    # recent prefill chunk, accumulated across chunks so that the final W
+    # queries of the full prefill are available for compression).
+    # {layer_idx: [<=W, num_query_heads, head_dim]}
+    observation_queries_per_layer: dict[int, torch.Tensor] = field(
+        default_factory=dict
+    )
+
 
 class SnapKVRequestStateRegistry:
     """Registry of per-request SnapKV states, held by the metadata builder.

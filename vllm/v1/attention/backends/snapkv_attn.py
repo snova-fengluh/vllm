@@ -879,14 +879,6 @@ class SnapKVAttentionImpl(AttentionImpl):
             attn_metadata.needs_first_decode_compress is not None
             and bool(attn_metadata.needs_first_decode_compress.any().item())
         ):
-            n_compress = int(
-                attn_metadata.needs_first_decode_compress.sum().item()
-            )
-            logger.info(
-                "SnapKV FIRST-DECODE COMPRESS layer=%d: %d request(s) "
-                "triggering top-k compression from paged cache",
-                layer_idx, n_compress,
-            )
             self._do_first_decode_compression(
                 kv_cache, attn_metadata, layer_idx
             )
@@ -909,12 +901,6 @@ class SnapKVAttentionImpl(AttentionImpl):
         )
 
         if has_compressed_decode:
-            n_comp = int(attn_metadata.is_compressed.sum().item())
-            n_total = int(attn_metadata.is_compressed.shape[0])
-            logger.info(
-                "SnapKV DECODE layer=%d: %d/%d requests using compressed KV",
-                layer_idx, n_comp, n_total,
-            )
             self._decode_mixed_forward(
                 layer, query, kv_cache, attn_metadata, output, layer_idx
             )
@@ -1084,95 +1070,148 @@ class SnapKVAttentionImpl(AttentionImpl):
             dense_KV   = [compressed | tail]   # along seq dim
         Run dense FA with causal=False over dense_KV.
 
-        Per-row dense lengths can differ (different decode progress), so
-        we pad to the per-batch maximum for the varlen call.
+        Implementation notes:
+          * Tail-token gather, slot computation and GQA expansion are
+            batched across all compressed rows: one paged gather, one
+            ``repeat_interleave``.
+          * The varlen K/V buffer is pre-allocated once and filled via a
+            small per-row scatter loop. The per-row work is just two
+            ``copy_`` kernels (one for K, one for V); the
+            ``[H_q, W, D] -> [W, H_q, D]`` reshape on stored compressed
+            K/V is a free stride change (transpose), with the layout flip
+            fused into the copy.
         """
-        head_dim = self.head_size
         H_q = self.num_heads
+        D = self.head_size
         block_size = kv_cache.shape[2]
-        key_cache = kv_cache[0]
-        value_cache = kv_cache[1]
+        n_rep = self.num_queries_per_kv
 
-        # Per-row Python data
-        per_row_dense_k: list[torch.Tensor] = []
-        per_row_dense_v: list[torch.Tensor] = []
+        # ------------------------------------------------------------------
+        # CPU-side pre-computation: no GPU work, just integer arithmetic.
+        # ------------------------------------------------------------------
+        rows = comp_row_cpu.tolist()
+        seq_lens_cpu_list = attn_metadata.seq_lens_cpu.tolist()
+
+        states: list[SnapKVRequestState] = []
+        window_lens: list[int] = []
+        tail_lens: list[int] = []
+        prefill_lens: list[int] = []
         per_row_lens: list[int] = []
-
-        for idx in range(N):
-            row_i = int(comp_row_cpu[idx])
-            state = attn_metadata.request_states[row_i]
+        for r in rows:
+            state = attn_metadata.request_states[r]
             assert state is not None
             assert layer_idx in state.compressed_keys_per_layer, (
                 f"SnapKV decode: layer {layer_idx} missing compressed K "
-                f"for request idx {row_i}"
+                f"for request idx {r}"
             )
+            states.append(state)
+            wl = state.compressed_keys_per_layer[layer_idx].shape[1]
+            pl = state.prefill_length
+            tl = max(0, seq_lens_cpu_list[r] - pl)
+            window_lens.append(wl)
+            prefill_lens.append(pl)
+            tail_lens.append(tl)
+            per_row_lens.append(wl + tl)
 
-            # Transfer compressed K/V from CPU to GPU just-in-time.
-            comp_k = state.compressed_keys_per_layer[layer_idx].to(
-                device, non_blocking=True,
-            )   # [H_q, W, D]
-            comp_v = state.compressed_values_per_layer[layer_idx].to(
-                device, non_blocking=True,
-            )
-            window_len = comp_k.shape[1]
-
-            seq_len_i = int(attn_metadata.seq_lens_cpu[row_i].item())
-            prefill_len = state.prefill_length
-            tail_len = max(0, seq_len_i - prefill_len)
-
-            block_table_row = attn_metadata.block_table[row_i]
-
-            if tail_len > 0:
-                tail_idx = torch.arange(
-                    prefill_len, seq_len_i, dtype=torch.int64, device=device
-                )
-                tail_k_kv, tail_v_kv = _gather_paged_kv(
-                    kv_cache, block_table_row, tail_idx, block_size,
-                )
-                # GQA expand to query head level.
-                tail_k, tail_v = _repeat_kv(
-                    tail_k_kv, tail_v_kv, self.num_queries_per_kv
-                )
-                # Permute to [H_q, tail_len, D] to match compressed layout.
-                tail_k = tail_k.permute(1, 0, 2).contiguous()
-                tail_v = tail_v.permute(1, 0, 2).contiguous()
-                dense_k = torch.cat([comp_k, tail_k], dim=1)
-                dense_v = torch.cat([comp_v, tail_v], dim=1)
-            else:
-                dense_k = comp_k
-                dense_v = comp_v
-
-            per_row_dense_k.append(dense_k)
-            per_row_dense_v.append(dense_v)
-            per_row_lens.append(int(dense_k.shape[1]))
-
-        # Build varlen inputs by concatenating along the seq dim.
-        # Each row contributes per_row_lens[i] entries; we go to layout
-        # [sum_lens, H_q, D].
-        comp_gpu = comp_row_cpu.to(device, dtype=torch.long, non_blocking=True)
-
-        # Permute each [H_q, L_i, D] -> [L_i, H_q, D] then cat.
-        cat_k = torch.cat(
-            [t.permute(1, 0, 2).contiguous() for t in per_row_dense_k], dim=0
-        )
-        cat_v = torch.cat(
-            [t.permute(1, 0, 2).contiguous() for t in per_row_dense_v], dim=0
-        )
-        # cat_k: [sum_L, H_q, D]
+        total_dense = sum(per_row_lens)
+        total_tail = sum(tail_lens)
 
         cu_seqlens_k_list = [0]
-        running = 0
+        acc = 0
         for L in per_row_lens:
-            running += L
-            cu_seqlens_k_list.append(running)
-        cu_seqlens_k = torch.tensor(
-            cu_seqlens_k_list, dtype=torch.int32, device=device
-        )
+            acc += L
+            cu_seqlens_k_list.append(acc)
         max_seqlen_k = max(per_row_lens) if per_row_lens else 1
 
-        cu_seqlens_q = torch.arange(
-            0, N + 1, dtype=torch.int32, device=device
+        # ------------------------------------------------------------------
+        # Allocate output K/V buffer once. Layout: [total_dense, H_q, D].
+        # ------------------------------------------------------------------
+        dtype = query.dtype
+        cat_k = torch.empty(total_dense, H_q, D, device=device, dtype=dtype)
+        cat_v = torch.empty(total_dense, H_q, D, device=device, dtype=dtype)
+
+        # ------------------------------------------------------------------
+        # Batched tail gather + GQA expand (one kernel each across all rows).
+        # ------------------------------------------------------------------
+        tail_k_all: torch.Tensor | None = None
+        tail_v_all: torch.Tensor | None = None
+        if total_tail > 0:
+            # Build flat (position, row) lists on CPU, then one transfer.
+            flat_tail_pos_list: list[int] = []
+            flat_row_idx_list: list[int] = []
+            for i, r in enumerate(rows):
+                tl = tail_lens[i]
+                if tl > 0:
+                    pl = prefill_lens[i]
+                    flat_tail_pos_list.extend(range(pl, pl + tl))
+                    flat_row_idx_list.extend([r] * tl)
+            flat_tail_pos = torch.tensor(
+                flat_tail_pos_list, dtype=torch.int64, device=device,
+            )
+            flat_row_idx = torch.tensor(
+                flat_row_idx_list, dtype=torch.int64, device=device,
+            )
+
+            block_indices = flat_tail_pos // block_size
+            slot_offsets = flat_tail_pos % block_size
+            # block_table[row, block_idx] -> physical block id.
+            phys_blocks = attn_metadata.block_table[
+                flat_row_idx, block_indices
+            ].long()
+            flat_slots = phys_blocks * block_size + slot_offsets
+
+            # One gather kernel each for K and V across all rows' tails.
+            key_cache_flat = kv_cache[0].view(-1, self.num_kv_heads, D)
+            value_cache_flat = kv_cache[1].view(-1, self.num_kv_heads, D)
+            tail_k_all = key_cache_flat[flat_slots]
+            tail_v_all = value_cache_flat[flat_slots]
+            # [total_tail, num_kv_heads, D]
+
+            # Batched GQA expand: equivalent to per-row _repeat_kv (which is
+            # unsqueeze+expand+reshape — i.e. interleaved, not tiled).
+            if n_rep > 1:
+                tail_k_all = tail_k_all.repeat_interleave(n_rep, dim=1)
+                tail_v_all = tail_v_all.repeat_interleave(n_rep, dim=1)
+            # tail_k_all: [total_tail, H_q, D]
+
+        # ------------------------------------------------------------------
+        # Scatter compressed window + tail tokens into the pre-allocated
+        # output. Each iteration issues 2 copy_ kernels (K and V) for the
+        # compressed window plus 2 for the tail if present.
+        # ------------------------------------------------------------------
+        tail_offset = 0
+        for i, state in enumerate(states):
+            wl = window_lens[i]
+            tl = tail_lens[i]
+            base = cu_seqlens_k_list[i]
+
+            # Stored layout [H_q, wl, D] -> output layout [wl, H_q, D].
+            # transpose is a free stride change; copy_ reorders during copy.
+            comp_k = state.compressed_keys_per_layer[layer_idx]
+            comp_v = state.compressed_values_per_layer[layer_idx]
+            cat_k[base:base + wl].copy_(comp_k.transpose(0, 1))
+            cat_v[base:base + wl].copy_(comp_v.transpose(0, 1))
+
+            if tl > 0:
+                assert tail_k_all is not None and tail_v_all is not None
+                cat_k[base + wl:base + wl + tl].copy_(
+                    tail_k_all[tail_offset:tail_offset + tl]
+                )
+                cat_v[base + wl:base + wl + tl].copy_(
+                    tail_v_all[tail_offset:tail_offset + tl]
+                )
+                tail_offset += tl
+
+        # ------------------------------------------------------------------
+        # FA varlen call.
+        # ------------------------------------------------------------------
+        cu_seqlens_k = torch.tensor(
+            cu_seqlens_k_list, dtype=torch.int32, device=device,
         )
+        cu_seqlens_q = torch.arange(
+            0, N + 1, dtype=torch.int32, device=device,
+        )
+        comp_gpu = comp_row_cpu.to(device, dtype=torch.long, non_blocking=True)
 
         q_comp = query[comp_gpu]                              # [N, H_q, D]
         out_comp = torch.empty_like(q_comp)
@@ -1258,8 +1297,12 @@ class SnapKVAttentionImpl(AttentionImpl):
           2. Compute top-k indices using _snapkv_compute_topk_indices.
           3. Gather only the selected top-k + observation window positions'
              K/V from paged cache (much smaller than the full gather).
-          4. Store compressed K/V on CPU to avoid GPU memory accumulation
-             across all layers (~9 GB for 62 layers x 3 requests on GPU).
+          4. Store compressed K/V on GPU. Steady-state size is bounded
+             (num_layers x num_reqs x 2 x H_q x W x D x dtype), e.g.
+             ~9 GB for 62 layers x 3 requests on the analysis config,
+             well within H200's budget. CPU storage was previously used
+             but caused a CPU->GPU transfer every decode step per layer
+             per request, dominating decode latency.
         """
         if layer_idx < self.num_full_kv_layer:
             return
@@ -1390,7 +1433,6 @@ class SnapKVAttentionImpl(AttentionImpl):
                 del k_per_head, v_per_head, kv_sel
             else:
                 # No past tokens to select; use only observation window.
-                actual_k = 0
                 k_obs, v_obs = _gather_paged_kv(
                     kv_cache, block_table_row, obs_positions, block_size,
                 )
@@ -1407,22 +1449,13 @@ class SnapKVAttentionImpl(AttentionImpl):
             del obs_positions
 
             # ----------------------------------------------------------
-            # Step 4: Store on CPU to avoid GPU memory accumulation.
+            # Step 4: Store on GPU. The CPU->GPU transfer at every decode
+            # step was the dominant bottleneck; steady-state GPU footprint
+            # is bounded and fits comfortably (see method docstring).
             # ----------------------------------------------------------
-            state.compressed_keys_per_layer[layer_idx] = comp_k.cpu()
-            state.compressed_values_per_layer[layer_idx] = comp_v.cpu()
+            state.compressed_keys_per_layer[layer_idx] = comp_k
+            state.compressed_values_per_layer[layer_idx] = comp_v
             state.prefill_length = prefill_len
-            del comp_k, comp_v
-
-            logger.info(
-                "SnapKV COMPRESSED row=%d layer=%d: "
-                "prefill_seq_len=%d -> compressed shape=[%d, %d, %d] "
-                "(topk=%d + obs_window=%d), prefill_length=%d, "
-                "stored on CPU",
-                row_i, layer_idx, prefill_len,
-                num_q_heads, actual_k + actual_w, head_dim,
-                actual_k, actual_w, state.prefill_length,
-            )
 
             # Free observation queries for this layer (no longer needed).
             state.observation_queries_per_layer.pop(layer_idx, None)

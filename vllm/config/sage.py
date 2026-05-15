@@ -36,6 +36,19 @@ class SageConfig:
     """Number of early layers to use full KV cache (no SAGE eviction).
     Set to 0 to apply SAGE to all layers."""
 
+    growing_recent_window: bool = False
+    """Control the recent-window policy during decode.
+
+    If False (default): StreamingLLM-style sliding recent window. The recent
+    window has a fixed length of (window_length - num_sink_tokens - top_k)
+    and the oldest recent token is evicted each decode step.
+
+    If True: the recent window's starting position is frozen at the first
+    long decode step and only new tokens are appended thereafter, so the
+    recent window grows by one token per decode step. Memory cost for
+    long-context requests grows linearly with the number of generated
+    tokens."""
+
     def __post_init__(self):
         if self.enabled:
             # Validate configuration

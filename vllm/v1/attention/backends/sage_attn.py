@@ -10,8 +10,19 @@ Algorithm (per decode row whose seq_len > window_length):
      Store indices on SageRequestState (done once at prefill→decode edge).
   3. Build dense KV = concat(paged[0:num_sink],
                              paged[topk_indices],
-                             paged[seq_len - (recent - 1) : seq_len])
+                             paged[recent_start : seq_len])
   4. Run flash_attn_varlen_func against the dense KV (causal=False).
+
+Recent-window policy (controlled by SageConfig.growing_recent_window):
+  * False (default, StreamingLLM-style): the recent slice for each request
+    is always the last ``recent_window`` tokens, i.e.
+    ``recent_start = seq_len - recent_window``. The oldest recent token is
+    evicted each decode step; recent length is constant.
+  * True (growing): ``recent_start`` is frozen at the first long-decode step
+    to ``seq_len - recent_window`` and reused thereafter. The recent slice
+    is ``[recent_start, seq_len - 1]`` and grows by one token per decode
+    step. Memory cost per long-context request grows linearly with the
+    number of generated tokens.
 """
 
 from __future__ import annotations
@@ -234,6 +245,7 @@ class SageAttentionMetadataBuilder(AttentionMetadataBuilder[SageAttentionMetadat
             self.sage_window_length = sage_cfg.window_length
             self.sage_num_sink_tokens = sage_cfg.num_sink_tokens
             self.sage_top_k = sage_cfg.top_k
+            self.sage_growing_recent_window = sage_cfg.growing_recent_window
         else:
             hf_config = self.model_config.hf_config
             self.sage_window_length = getattr(
@@ -243,6 +255,9 @@ class SageAttentionMetadataBuilder(AttentionMetadataBuilder[SageAttentionMetadat
                 hf_config, "sage_num_sink_tokens", SAGE_DEFAULT_NUM_SINK_TOKENS
             )
             self.sage_top_k = getattr(hf_config, "sage_top_k", SAGE_DEFAULT_TOP_K)
+            self.sage_growing_recent_window = getattr(
+                hf_config, "sage_growing_recent_window", False
+            )
 
         self.sage_recent_window = (
             self.sage_window_length - self.sage_num_sink_tokens - self.sage_top_k
@@ -252,11 +267,13 @@ class SageAttentionMetadataBuilder(AttentionMetadataBuilder[SageAttentionMetadat
         self.state_registry = SageRequestStateRegistry()
 
         logger.info(
-            "SAGE Attention initialized: window=%d, sink=%d, top_k=%d, recent=%d",
+            "SAGE Attention initialized: window=%d, sink=%d, top_k=%d, "
+            "recent=%d, growing_recent_window=%s",
             self.sage_window_length,
             self.sage_num_sink_tokens,
             self.sage_top_k,
             self.sage_recent_window,
+            self.sage_growing_recent_window,
         )
 
     def build(
@@ -522,6 +539,7 @@ class SageAttentionImpl(AttentionImpl):
             self.sage_window_length = sage_cfg.window_length
             self.sage_num_sink_tokens = sage_cfg.num_sink_tokens
             self.sage_top_k = sage_cfg.top_k
+            self.sage_growing_recent_window = sage_cfg.growing_recent_window
         else:
             hf_config = vllm_config.model_config.hf_config
             self.sage_window_length = getattr(
@@ -531,6 +549,9 @@ class SageAttentionImpl(AttentionImpl):
                 hf_config, "sage_num_sink_tokens", SAGE_DEFAULT_NUM_SINK_TOKENS
             )
             self.sage_top_k = getattr(hf_config, "sage_top_k", SAGE_DEFAULT_TOP_K)
+            self.sage_growing_recent_window = getattr(
+                hf_config, "sage_growing_recent_window", False
+            )
 
         self.sage_recent_window = (
             self.sage_window_length - self.sage_num_sink_tokens - self.sage_top_k
@@ -795,6 +816,16 @@ class SageAttentionImpl(AttentionImpl):
         recent = self.sage_recent_window
         top_k = self.sage_top_k
 
+        # In growing mode, freeze the recent-window start at the first long
+        # decode step. The first long decode is exactly the step at which
+        # _compute_topk_for_row runs (gated by is_first_long_decode), so the
+        # anchor is captured at most once per request.
+        if (
+            self.sage_growing_recent_window
+            and state.recent_window_start is None
+        ):
+            state.recent_window_start = seq_len - recent
+
         cand_start = num_sink
         cand_end = seq_len - recent
         num_candidates = max(0, cand_end - cand_start)
@@ -833,16 +864,23 @@ class SageAttentionImpl(AttentionImpl):
     ) -> None:
         """Batched SAGE decode for all long-context rows.
 
-        Replaces the per-row loop with:
+        Common preamble:
         1. One batched gather for sink tokens across all rows
-        2. One batched gather for recent tokens across all rows
-        3. One stack for stored top-k KV
-        4. One batched GQA expansion
-        5. One flash_attn_varlen_func call for all SAGE rows
+        2. GQA expansion for sink
+        3. One stack for stored top-k KV across all rows
+
+        Recent gather + dense-KV assembly is mode-dependent:
+        * Fixed recent window (StreamingLLM-style): uniform-length recent
+          window per row, dense KV laid out as [N, wl, num_heads, D] and
+          flattened.  See ``_assemble_dense_kv_fixed``.
+        * Growing recent window: per-row variable length, dense KV packed
+          into ``[total_dense, num_heads, D]`` with varlen ``cu_seqlens_k``.
+          See ``_assemble_dense_kv_growing``.
+
+        Common epilogue: one flash_attn_varlen_func call.
         """
         device = query.device
         num_sink = self.sage_num_sink_tokens
-        recent = self.sage_recent_window
         top_k = self.sage_top_k
         head_dim = self.head_size
         block_size = kv_cache.shape[2]
@@ -854,13 +892,11 @@ class SageAttentionImpl(AttentionImpl):
         block_table_sage = attn_metadata.block_table[sage_gpu]  # [N, max_blk]
         seq_lens_sage = attn_metadata.seq_lens[sage_gpu]        # [N] GPU
 
-        # ---- 1. Batched sink gather ----
-        # Sink indices are the same for every row → use cached tensor.
+        # ---- 1. Batched sink gather (uniform across rows) ----
         sink_idx = self._cached_sink_indices          # [num_sink]
         sink_blk = sink_idx // block_size             # [num_sink]
         sink_off = sink_idx % block_size              # [num_sink]
 
-        # Physical blocks: block_table_sage[:, sink_blk] → [N, num_sink]
         sink_phys = block_table_sage[:, sink_blk]
         flat_sink_phys = sink_phys.reshape(-1)        # [N * num_sink]
         flat_sink_off = sink_off.unsqueeze(0).expand(N, -1).reshape(-1)
@@ -870,43 +906,18 @@ class SageAttentionImpl(AttentionImpl):
         sink_v = value_cache[flat_sink_phys, flat_sink_off].reshape(
             N, num_sink, self.num_kv_heads, head_dim)
 
-        # ---- 2. Batched recent gather ----
-        offsets = torch.arange(recent, device=device, dtype=torch.long)
-        # recent_pos[i, j] = seq_lens_sage[i] - recent + j
-        recent_pos = (seq_lens_sage.unsqueeze(1).long() - recent
-                      + offsets.unsqueeze(0))          # [N, recent]
-
-        recent_blk_idx = recent_pos // block_size      # [N, recent]
-        recent_slot_off = recent_pos % block_size      # [N, recent]
-
-        recent_phys = torch.gather(
-            block_table_sage.long(), 1, recent_blk_idx)  # [N, recent]
-        flat_recent_phys = recent_phys.reshape(-1)
-        flat_recent_off = recent_slot_off.reshape(-1)
-
-        recent_k = key_cache[flat_recent_phys, flat_recent_off].reshape(
-            N, recent, self.num_kv_heads, head_dim)
-        recent_v = value_cache[flat_recent_phys, flat_recent_off].reshape(
-            N, recent, self.num_kv_heads, head_dim)
-
-        # ---- 3. GQA expansion for sink & recent ----
+        # ---- 2. GQA expansion for sink (sink-only here; recent handled
+        #         inside the mode-specific assembly) ----
         n_rep = self.num_queries_per_kv
         if n_rep > 1:
-            # [N, S, kv_h, D] → [N, S, kv_h, n_rep, D] → [N, S, q_h, D]
             sink_k = (sink_k.unsqueeze(3)
                       .expand(-1, -1, -1, n_rep, -1)
                       .reshape(N, num_sink, self.num_heads, head_dim))
             sink_v = (sink_v.unsqueeze(3)
                       .expand(-1, -1, -1, n_rep, -1)
                       .reshape(N, num_sink, self.num_heads, head_dim))
-            recent_k = (recent_k.unsqueeze(3)
-                        .expand(-1, -1, -1, n_rep, -1)
-                        .reshape(N, recent, self.num_heads, head_dim))
-            recent_v = (recent_v.unsqueeze(3)
-                        .expand(-1, -1, -1, n_rep, -1)
-                        .reshape(N, recent, self.num_heads, head_dim))
 
-        # ---- 4. Stack stored top-k KV ----
+        # ---- 3. Stack stored top-k KV ----
         # Each state stores [num_q_heads, top_k, head_dim].
         topk_k_list: list[torch.Tensor] = []
         topk_v_list: list[torch.Tensor] = []
@@ -930,24 +941,29 @@ class SageAttentionImpl(AttentionImpl):
         topk_k = torch.stack(topk_k_list, dim=0)  # [N, top_k, q_heads, D]
         topk_v = torch.stack(topk_v_list, dim=0)
 
-        # ---- 5. Concatenate dense KV ----
-        # Each part: [N, *, num_q_heads, head_dim]
-        dense_k = torch.cat([sink_k, topk_k, recent_k], dim=1)
-        dense_v = torch.cat([sink_v, topk_v, recent_v], dim=1)
-        wl = dense_k.shape[1]  # window_length
+        # ---- 4. Mode-specific recent gather + dense KV assembly ----
+        if self.sage_growing_recent_window:
+            dense_k, dense_v, cu_seqlens_k, max_seqlen_k = (
+                self._assemble_dense_kv_growing(
+                    key_cache, value_cache, block_table_sage, seq_lens_sage,
+                    sink_k, sink_v, topk_k, topk_v,
+                    sage_row_cpu, attn_metadata.request_states,
+                    N, block_size, n_rep, query.dtype, device,
+                )
+            )
+        else:
+            dense_k, dense_v, cu_seqlens_k, max_seqlen_k = (
+                self._assemble_dense_kv_fixed(
+                    key_cache, value_cache, block_table_sage, seq_lens_sage,
+                    sink_k, sink_v, topk_k, topk_v,
+                    N, block_size, n_rep, device,
+                )
+            )
 
-        # Flatten for varlen: [N * wl, num_q_heads, head_dim]
-        dense_k = dense_k.reshape(N * wl, self.num_heads, head_dim)
-        dense_v = dense_v.reshape(N * wl, self.num_heads, head_dim)
-
-        # ---- 6. One batched dense FA call ----
+        # ---- 5. One batched dense FA call ----
         q_sage = query[sage_gpu]  # [N, num_q_heads, head_dim]
-
         cu_seqlens_q = torch.arange(
             0, N + 1, dtype=torch.int32, device=device)
-        cu_seqlens_k = (torch.arange(
-            0, N + 1, dtype=torch.int32, device=device) * wl)
-
         out_sage = torch.empty_like(q_sage)
         flash_attn_varlen_func(
             q=q_sage,
@@ -957,7 +973,7 @@ class SageAttentionImpl(AttentionImpl):
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=1,
             cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_k=wl,
+            max_seqlen_k=max_seqlen_k,
             softmax_scale=self.scale,
             causal=False,
             alibi_slopes=None,
@@ -967,3 +983,211 @@ class SageAttentionImpl(AttentionImpl):
             fa_version=self.vllm_flash_attn_version,
         )
         output[sage_gpu] = out_sage
+
+    # ---- Dense-KV assembly: fixed-length recent window ----
+
+    def _assemble_dense_kv_fixed(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table_sage: torch.Tensor,
+        seq_lens_sage: torch.Tensor,
+        sink_k: torch.Tensor,
+        sink_v: torch.Tensor,
+        topk_k: torch.Tensor,
+        topk_v: torch.Tensor,
+        N: int,
+        block_size: int,
+        n_rep: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Recent gather + dense KV assembly for the StreamingLLM-style
+        fixed-length recent window.
+
+        Each row's dense KV has the same length ``wl = num_sink + top_k +
+        recent``, so we keep a [N, wl, num_heads, D] tensor and flatten it.
+        ``cu_seqlens_k`` is the trivial ``arange * wl``.
+        """
+        num_sink = self.sage_num_sink_tokens
+        recent = self.sage_recent_window
+        head_dim = self.head_size
+
+        # ---- Batched recent gather (uniform length = recent) ----
+        offsets = torch.arange(recent, device=device, dtype=torch.long)
+        # recent_pos[i, j] = seq_lens_sage[i] - recent + j
+        recent_pos = (seq_lens_sage.unsqueeze(1).long() - recent
+                      + offsets.unsqueeze(0))         # [N, recent]
+        recent_blk_idx = recent_pos // block_size
+        recent_slot_off = recent_pos % block_size
+
+        recent_phys = torch.gather(
+            block_table_sage.long(), 1, recent_blk_idx)
+        flat_recent_phys = recent_phys.reshape(-1)
+        flat_recent_off = recent_slot_off.reshape(-1)
+
+        recent_k = key_cache[flat_recent_phys, flat_recent_off].reshape(
+            N, recent, self.num_kv_heads, head_dim)
+        recent_v = value_cache[flat_recent_phys, flat_recent_off].reshape(
+            N, recent, self.num_kv_heads, head_dim)
+
+        if n_rep > 1:
+            recent_k = (recent_k.unsqueeze(3)
+                        .expand(-1, -1, -1, n_rep, -1)
+                        .reshape(N, recent, self.num_heads, head_dim))
+            recent_v = (recent_v.unsqueeze(3)
+                        .expand(-1, -1, -1, n_rep, -1)
+                        .reshape(N, recent, self.num_heads, head_dim))
+
+        # ---- Concatenate dense KV ----
+        dense_k = torch.cat([sink_k, topk_k, recent_k], dim=1)
+        dense_v = torch.cat([sink_v, topk_v, recent_v], dim=1)
+        wl = dense_k.shape[1]
+
+        dense_k = dense_k.reshape(N * wl, self.num_heads, head_dim)
+        dense_v = dense_v.reshape(N * wl, self.num_heads, head_dim)
+
+        cu_seqlens_k = (torch.arange(
+            0, N + 1, dtype=torch.int32, device=device) * wl)
+        max_seqlen_k = wl
+
+        return dense_k, dense_v, cu_seqlens_k, max_seqlen_k
+
+    # ---- Dense-KV assembly: growing recent window ----
+
+    def _assemble_dense_kv_growing(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table_sage: torch.Tensor,
+        seq_lens_sage: torch.Tensor,
+        sink_k: torch.Tensor,
+        sink_v: torch.Tensor,
+        topk_k: torch.Tensor,
+        topk_v: torch.Tensor,
+        sage_row_cpu: torch.Tensor,
+        request_states: list,
+        N: int,
+        block_size: int,
+        n_rep: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Recent gather + dense KV assembly for the growing recent window.
+
+        Each row has a different recent length ``r_i = seq_len_i -
+        recent_window_start_i``, so the dense KV is packed varlen-style:
+        ``dense_k`` shape is ``[total_dense, num_heads, head_dim]`` with
+        ``cu_seqlens_k[i+1] - cu_seqlens_k[i] = num_sink + top_k + r_i``.
+        """
+        num_sink = self.sage_num_sink_tokens
+        top_k = self.sage_top_k
+        head_dim = self.head_size
+        num_heads = self.num_heads
+        num_kv_heads = self.num_kv_heads
+
+        # ---- 1. Per-row recent_window_start (frozen anchor) ----
+        # Built on CPU then moved to GPU once: anchors live as Python ints
+        # on SageRequestState.  N is small (number of long-context decode
+        # rows in this batch), so this loop is cheap.
+        recent_starts_cpu = torch.empty(N, dtype=torch.long)
+        for idx in range(N):
+            row_i = int(sage_row_cpu[idx])
+            state = request_states[row_i]
+            if state is not None and state.recent_window_start is not None:
+                recent_starts_cpu[idx] = state.recent_window_start
+            else:
+                # Defensive fallback: should not happen because
+                # _compute_topk_for_row sets the anchor at first long decode.
+                # Fall back to the streaming-style start so attention is
+                # still well-defined.
+                recent_starts_cpu[idx] = -self.sage_recent_window
+        recent_starts = recent_starts_cpu.to(
+            device, dtype=torch.long, non_blocking=True)
+        # If we fell back (recent_starts_cpu < 0), interpret it relative to
+        # the current seq_len: -recent → seq_len - recent.
+        recent_starts = torch.where(
+            recent_starts < 0,
+            seq_lens_sage.long() + recent_starts,
+            recent_starts,
+        )
+
+        # ---- 2. Per-row recent lengths and packed cu_seqlens_k ----
+        r = seq_lens_sage.long() - recent_starts       # [N]
+        wl = (num_sink + top_k) + r                    # [N]
+        cu_seqlens_k = torch.empty(
+            N + 1, dtype=torch.int32, device=device)
+        cu_seqlens_k[0] = 0
+        cu_seqlens_k[1:] = wl.to(torch.int32).cumsum(0, dtype=torch.int32)
+        dense_start = cu_seqlens_k[:-1].long()         # [N]
+
+        # Single GPU→CPU sync to learn total_dense + max_seqlen_k.
+        totals = torch.stack([wl.sum(), wl.max()]).cpu()
+        total_dense = int(totals[0].item())
+        max_seqlen_k = int(totals[1].item())
+        total_recent = total_dense - N * (num_sink + top_k)
+
+        # ---- 3. Allocate packed dense buffer ----
+        dense_k = torch.empty(
+            total_dense, num_heads, head_dim, device=device, dtype=dtype)
+        dense_v = torch.empty_like(dense_k)
+
+        # ---- 4. Scatter sink (uniform per-row width) ----
+        arange_sink = torch.arange(
+            num_sink, device=device, dtype=torch.long)
+        sink_dest = (dense_start.unsqueeze(1)
+                     + arange_sink.unsqueeze(0)).reshape(-1)  # [N*num_sink]
+        dense_k[sink_dest] = sink_k.reshape(-1, num_heads, head_dim)
+        dense_v[sink_dest] = sink_v.reshape(-1, num_heads, head_dim)
+
+        # ---- 5. Scatter topk (uniform per-row width) ----
+        arange_topk = torch.arange(
+            top_k, device=device, dtype=torch.long)
+        topk_dest = (dense_start.unsqueeze(1) + num_sink
+                     + arange_topk.unsqueeze(0)).reshape(-1)  # [N*top_k]
+        dense_k[topk_dest] = topk_k.reshape(-1, num_heads, head_dim)
+        dense_v[topk_dest] = topk_v.reshape(-1, num_heads, head_dim)
+
+        # ---- 6. Gather + scatter recent (variable per-row width) ----
+        # row_id_flat[k] = row index of the k-th element across the packed
+        # recent layout (length total_recent).
+        row_id_flat = torch.repeat_interleave(
+            torch.arange(N, device=device, dtype=torch.long),
+            r,
+            output_size=total_recent,
+        )
+
+        # Per-row starting offsets within the packed recent layout.
+        recent_cumsum = torch.empty(
+            N + 1, dtype=torch.long, device=device)
+        recent_cumsum[0] = 0
+        recent_cumsum[1:] = r.cumsum(0)
+        flat_arange = torch.arange(
+            total_recent, device=device, dtype=torch.long)
+        offset_in_row = flat_arange - recent_cumsum[row_id_flat]
+
+        # Source token positions in each request's sequence.
+        recent_positions = recent_starts[row_id_flat] + offset_in_row
+        recent_blk = recent_positions // block_size
+        recent_off = recent_positions % block_size
+        recent_phys = block_table_sage.long()[row_id_flat, recent_blk]
+
+        recent_k_kv = key_cache[recent_phys, recent_off]
+        recent_v_kv = value_cache[recent_phys, recent_off]
+
+        if n_rep > 1:
+            recent_k_pkd = (recent_k_kv.unsqueeze(2)
+                            .expand(-1, num_kv_heads, n_rep, head_dim)
+                            .reshape(total_recent, num_heads, head_dim))
+            recent_v_pkd = (recent_v_kv.unsqueeze(2)
+                            .expand(-1, num_kv_heads, n_rep, head_dim)
+                            .reshape(total_recent, num_heads, head_dim))
+        else:
+            recent_k_pkd = recent_k_kv
+            recent_v_pkd = recent_v_kv
+
+        recent_dest = (dense_start[row_id_flat] + num_sink + top_k
+                       + offset_in_row)
+        dense_k[recent_dest] = recent_k_pkd
+        dense_v[recent_dest] = recent_v_pkd
+
+        return dense_k, dense_v, cu_seqlens_k, max_seqlen_k

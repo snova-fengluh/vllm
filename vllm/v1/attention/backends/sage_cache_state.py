@@ -38,6 +38,15 @@ class SageRequestState:
     # True once the first decode step after prefill has been processed.
     prefill_done: bool = False
 
+    # Absolute token position (within this request's sequence) of the first
+    # token in the recent window, captured at the first long-decode step.
+    # Used only when SageConfig.growing_recent_window is True. When set, the
+    # recent window for this request is [recent_window_start, seq_len - 1]
+    # and grows by one token per decode step. None when the streaming
+    # (fixed-length) policy is in use, or before the first long decode has
+    # happened.
+    recent_window_start: int | None = None
+
 
 class SageRequestStateRegistry:
     """Registry of per-request SAGE states, held by the metadata builder.

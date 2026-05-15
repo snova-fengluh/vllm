@@ -567,6 +567,7 @@ class EngineArgs:
     sage_num_sink_tokens: int = SageConfig.num_sink_tokens
     sage_top_k: int = SageConfig.top_k
     sage_num_full_kv_layer: int = SageConfig.num_full_kv_layer
+    sage_growing_recent_window: bool = SageConfig.growing_recent_window
 
     # SnapKV attention fields
     snapkv_enabled: bool = SnapKVConfig.enabled
@@ -1258,6 +1259,10 @@ class EngineArgs:
         sage_group.add_argument(
             "--sage-num-full-kv-layer", **sage_kwargs["num_full_kv_layer"]
         )
+        sage_group.add_argument(
+            "--sage-growing-recent-window",
+            **sage_kwargs["growing_recent_window"],
+        )
 
         # SnapKV attention arguments
         snapkv_kwargs = get_kwargs(SnapKVConfig)
@@ -1539,11 +1544,13 @@ class EngineArgs:
             logger.info(
                 "SAGE ATTENTION ENABLED  "
                 "window=%d  sink=%d  top_k=%d  "
-                "full_kv_layers=%d  arch=MiniMaxM2SageForCausalLM",
+                "full_kv_layers=%d  growing_recent_window=%s  "
+                "arch=MiniMaxM2SageForCausalLM",
                 self.sage_window_length,
                 self.sage_num_sink_tokens,
                 self.sage_top_k,
                 self.sage_num_full_kv_layer,
+                self.sage_growing_recent_window,
             )
 
             # Always use a callable to override architecture for SAGE
@@ -2135,6 +2142,7 @@ class EngineArgs:
                 num_sink_tokens=self.sage_num_sink_tokens,
                 top_k=self.sage_top_k,
                 num_full_kv_layer=self.sage_num_full_kv_layer,
+                growing_recent_window=self.sage_growing_recent_window,
             )
             if self.sage_enabled
             else None

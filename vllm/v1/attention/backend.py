@@ -392,6 +392,11 @@ class CommonAttentionMetadata:
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
     """Sequence lengths of the local rank in decode context parallelism world"""
 
+    positions: torch.Tensor | None = None
+    """(num_actual_tokens,) token positions.  Optional; set when the caller
+    has positions available so that builders can pre-compute position-dependent
+    metadata (e.g. C128A topk indices for DeepSeek V4)."""
+
     is_prefilling: torch.Tensor | None = None
     """(batch_size,) bool tensor: True if request is still in prefill phase
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
@@ -400,6 +405,12 @@ class CommonAttentionMetadata:
     request_ids: list[str] | None = None
     """Per-row request ids.  Populated by the runner for backends that
     declare ``needs_request_ids = True`` (e.g. SAGE)."""
+
+    seq_lens_cpu_upper_bound: torch.Tensor | None = None
+    """(batch_size,) CPU upper bound on seq_lens. Precise for prefill rows
+    and for all rows outside async spec decode; optimistic for async-spec
+    decode rows (assumes every draft was accepted). Not safe for kernels
+    that need exact per-row context lengths on decode rows."""
 
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
